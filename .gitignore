@@ -1,0 +1,21 @@
+# Large binary files
+*.pkl
+.signal_temp/
+.screen_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files
+data/
+*.csv
+*.h5
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
