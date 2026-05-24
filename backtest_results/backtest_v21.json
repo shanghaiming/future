@@ -1,0 +1,84 @@
+{
+  "initial_capital": 500000,
+  "final_equity": 544693.7544905763,
+  "total_return": 0.08938750898115266,
+  "annual_return": 0.010305263893397365,
+  "max_drawdown": -0.5635755861513972,
+  "sharpe_ratio": 0.27653642047063537,
+  "total_trades": 392,
+  "win_rate": 0.5,
+  "profit_factor": 1.0801439399588102,
+  "avg_win": 11967.611794986833,
+  "avg_loss": 11079.645362305326,
+  "avg_hold_days": 23.237244897959183,
+  "avg_leveraged_return": 0.06164166898230921,
+  "reason_stats": {
+    "hard_stop": {
+      "count": 21,
+      "win_rate": 0.0,
+      "avg_pnl": -24944.310984575706
+    },
+    "max_loss": {
+      "count": 5,
+      "win_rate": 0.0,
+      "avg_pnl": -59014.44391647996
+    },
+    "time_exit": {
+      "count": 365,
+      "win_rate": 0.5342465753424658,
+      "avg_pnl": 2712.1609554710008
+    },
+    "trend_reverse": {
+      "count": 1,
+      "win_rate": 1.0,
+      "avg_pnl": 3005.4223171500003
+    }
+  },
+  "yearly_stats": {
+    "2018": {
+      "trades": 44,
+      "win_rate": 0.45454545454545453,
+      "total_pnl": 54569.032716005306
+    },
+    "2019": {
+      "trades": 48,
+      "win_rate": 0.5,
+      "total_pnl": -46992.26383568459
+    },
+    "2020": {
+      "trades": 49,
+      "win_rate": 0.42857142857142855,
+      "total_pnl": -7045.76610699168
+    },
+    "2021": {
+      "trades": 50,
+      "win_rate": 0.52,
+      "total_pnl": 18684.591826555145
+    },
+    "2022": {
+      "trades": 45,
+      "win_rate": 0.4666666666666667,
+      "total_pnl": -44970.488321614575
+    },
+    "2023": {
+      "trades": 46,
+      "win_rate": 0.5652173913043478,
+      "total_pnl": 27358.798265710353
+    },
+    "2024": {
+      "trades": 48,
+      "win_rate": 0.5625,
+      "total_pnl": 54867.39317381035
+    },
+    "2025": {
+      "trades": 45,
+      "win_rate": 0.5111111111111111,
+      "total_pnl": 138468.9605652754
+    },
+    "2026": {
+      "trades": 17,
+      "win_rate": 0.47058823529411764,
+      "total_pnl": -20898.837477490048
+    }
+  }
+}

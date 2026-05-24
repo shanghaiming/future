@@ -1,0 +1,6 @@
+[2026-05-15 20:52:25] cufi: 异常 ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-05-15 20:52:25] ✗ 东财API异常（可能被拉黑）
+[2026-05-15 20:52:25] API不可用，退出
+[2026-05-15 20:52:55] cufi: 异常 Missing dependencies for SOCKS support.
+[2026-05-15 20:52:55] ✗ 东财API异常（可能被拉黑）
+[2026-05-15 20:52:55] API不可用，退出
