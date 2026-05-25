@@ -476,22 +476,33 @@ def futures_symbols():
 
 @app.route('/api/futures/price/<symbol>')
 def futures_price(symbol):
-    """期货价格历史"""
+    """期货价格历史 - 支持日线/周线/月线"""
+    period = request.args.get('period', 'daily')
     fut = load_fut_data()
     if symbol not in fut:
         return jsonify([])
-    df = fut[symbol]
-    sub = df
+    df = fut[symbol].copy()
+    df = df.rename(columns={'vol': 'volume'})
+    df = df.set_index('trade_date')
+
+    if period == 'weekly':
+        df = df.resample('W').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum', 'oi': 'last'})
+        df = df.dropna(subset=['open'])
+    elif period == 'monthly':
+        df = df.resample('ME').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum', 'oi': 'last'})
+        df = df.dropna(subset=['open'])
+
+    df = df.reset_index()
     result = []
-    for _, row in sub.iterrows():
+    for _, row in df.iterrows():
         result.append({
             'date': row['trade_date'].strftime('%Y-%m-%d'),
             'open': float(row['open']),
             'high': float(row['high']),
             'low': float(row['low']),
             'close': float(row['close']),
-            'volume': float(row.get('vol', 0)),
-            'oi': float(row.get('oi', 0)),
+            'volume': float(row.get('volume', 0)) if pd.notna(row.get('volume', 0)) else 0,
+            'oi': float(row.get('oi', 0)) if pd.notna(row.get('oi', 0)) else 0,
         })
     return jsonify(result)
 

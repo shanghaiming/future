@@ -421,14 +421,15 @@ interface PriceBar { date: string; open: number; high: number; low: number; clos
 function FuturesPage() {
   const { data, loading } = useApi<FutSymbol[]>(`${API}/futures/symbols`)
   const [selected, setSelected] = useState('')
+  const [period, setPeriod] = useState<'daily' | 'weekly' | 'monthly'>('daily')
   const [priceData, setPriceData] = useState<PriceBar[]>([])
   const [priceLoading, setPriceLoading] = useState(false)
 
   useEffect(() => {
     if (!selected) { setPriceData([]); return }
     setPriceLoading(true)
-    fetch(`${API}/futures/price/${selected}`).then(r => r.json()).then(d => { setPriceData(d); setPriceLoading(false) }).catch(() => setPriceLoading(false))
-  }, [selected])
+    fetch(`${API}/futures/price/${selected}?period=${period}`).then(r => r.json()).then(d => { setPriceData(d); setPriceLoading(false) }).catch(() => setPriceLoading(false))
+  }, [selected, period])
 
   if (loading || !data) return <Loading />
   const sorted = [...data].sort((a, b) => b.ret_5d - a.ret_5d)
@@ -511,12 +512,26 @@ function FuturesPage() {
                 {selInfo && <span style={{ marginLeft: 12, fontSize: 20, fontWeight: 700, color: selInfo.ret_5d >= 0 ? '#ef5350' : '#26a69a' }}>{selInfo.close.toFixed(2)}</span>}
                 {selInfo && <span style={{ marginLeft: 8, fontSize: 13, color: selInfo.ret_5d >= 0 ? '#ef5350' : '#26a69a' }}>{selInfo.ret_5d >= 0 ? '+' : ''}{selInfo.ret_5d.toFixed(2)}%</span>}
               </div>
-              {selInfo && <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#78909c' }}>
-                <span>20日 {selInfo.ret_20d >= 0 ? '+' : ''}{selInfo.ret_20d.toFixed(1)}%</span>
-                <span>波动 {selInfo.vol_20d.toFixed(1)}%</span>
-                <span>量 {selInfo.volume?.toLocaleString()}</span>
-                <span>OI {selInfo.oi?.toLocaleString()}</span>
-              </div>}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ display: 'flex', borderRadius: 4, overflow: 'hidden', border: '1px solid var(--border)' }}>
+                  {([['daily', '日线'], ['weekly', '周线'], ['monthly', '月线']] as const).map(([val, label]) => (
+                    <div key={val} onClick={() => setPeriod(val)}
+                      style={{ padding: '4px 12px', cursor: 'pointer', fontSize: 12, fontWeight: 600, transition: 'all 0.15s',
+                        background: period === val ? 'rgba(79,195,247,0.2)' : 'transparent',
+                        color: period === val ? '#4fc3f7' : '#78909c',
+                        borderRight: val !== 'monthly' ? '1px solid var(--border)' : 'none',
+                      }}>
+                      {label}
+                    </div>
+                  ))}
+                </div>
+                {selInfo && <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#78909c' }}>
+                  <span>20日 {selInfo.ret_20d >= 0 ? '+' : ''}{selInfo.ret_20d.toFixed(1)}%</span>
+                  <span>波动 {selInfo.vol_20d.toFixed(1)}%</span>
+                  <span>量 {selInfo.volume?.toLocaleString()}</span>
+                  <span>OI {selInfo.oi?.toLocaleString()}</span>
+                </div>}
+              </div>
             </div>
             {priceLoading ? <Loading /> : klineOption ? <Chart height={600} option={klineOption} /> : <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-dim)' }}>无数据</div>}
           </div>
