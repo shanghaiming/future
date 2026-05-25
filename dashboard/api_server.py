@@ -13,6 +13,7 @@ TS_DIR = os.path.join(DATA_DIR, "futures_term_structure")
 OPT_DIR = os.path.join(DATA_DIR, "options")
 OPT_CALC_DIR = os.path.join(DATA_DIR, "options_calculated")
 FUT_DIR = os.path.join(DATA_DIR, "futures_weighted")
+FUT_DAILY_DIR = os.path.join(DATA_DIR, "futures_daily")
 
 app = Flask(__name__)
 CORS(app)
@@ -21,8 +22,26 @@ CORS(app)
 _ts_cache = None
 _opt_cache = None
 _fut_cache = None
+_fut_daily_cache = None
 _opt_calc_cache = None
 _opt_summary_cache = None
+
+# fi符号 -> daily符号映射 (rbfi -> RB, scfi -> SC, ...)
+FI_TO_DAILY = {
+    'afi': 'A', 'agfi': 'AG', 'alfi': 'AL', 'aofi': 'AO', 'apfi': 'AP',
+    'aufi': 'AU', 'bfi': 'BU', 'bcfi': 'BC', 'brfi': 'BR', 'bufi': 'B',
+    'bzfi': 'BZ', 'cffi': 'C', 'cfi': 'CF', 'cjfi': 'CJ', 'csfi': 'CS', 'cufi': 'CU',
+    'cyfi': 'CY', 'ebfi': 'EB', 'ecfi': 'EC', 'egfi': 'EG', 'fgfi': 'FG',
+    'fufi': 'FU', 'hcfi': 'HC', 'ifi': 'I', 'jdfi': 'JD', 'jfi': 'J',
+    'jmfi': 'JM', 'jrfi': 'JR', 'lfi': 'L', 'lcfi': 'LC', 'lhfi': 'LH',
+    'lrfi': 'LR', 'mafi': 'MA', 'mfi': 'M', 'nifi': 'NI', 'lufi': 'LU', 'nrfi': 'NR',
+    'oifi': 'OI', 'pfi': 'P', 'pbfi': 'PB', 'pffi': 'PF', 'pgfi': 'PG',
+    'pkfi': 'PK', 'ppfi': 'PP', 'rbfi': 'RB', 'rmfi': 'RM', 'rrfi': 'RR',
+    'rufi': 'RU', 'safi': 'SA', 'scfi': 'SC', 'shfi': 'SH', 'sifi': 'SI',
+    'smfi': 'SM', 'snfi': 'SN', 'spfi': 'SP', 'srfi': 'SR', 'ssfi': 'SS',
+    'tafi': 'TA', 'urfi': 'UR', 'vfi': 'V', 'whfi': 'WH', 'yfi': 'Y',
+    'zcfi': 'ZC', 'znfi': 'ZN', 'fbfi': 'FB', 'lgfi': 'LG', 'adfi': 'AD',
+}
 
 
 _ts_index_cache = None  # 品种→日期列表的索引
@@ -143,8 +162,13 @@ def load_fut_data():
         sym = os.path.basename(f).replace('.csv', '')
         df = pd.read_csv(f)
         if len(df) < 10: continue
-        df['trade_date'] = pd.to_datetime(df['trade_date'], format='mixed')
-        df = df.sort_values('trade_date').reset_index(drop=True)
+        # Filter tqsdk 1970-01-01 placeholder rows
+        df['trade_date'] = df['trade_date'].astype(str)
+        df = df[df['trade_date'] != '19700101']
+        if len(df) < 10: continue
+        df['trade_date'] = pd.to_datetime(df['trade_date'], format='mixed', errors='coerce')
+        df = df.dropna(subset=['trade_date'])
+        df = df.sort_values('trade_date').drop_duplicates(subset='trade_date', keep='first').reset_index(drop=True)
         all_data[sym] = df
     _fut_cache = all_data
     return _fut_cache
@@ -457,8 +481,7 @@ def futures_price(symbol):
     if symbol not in fut:
         return jsonify([])
     df = fut[symbol]
-    days = min(len(df), 250)
-    sub = df.tail(days)
+    sub = df
     result = []
     for _, row in sub.iterrows():
         result.append({
@@ -471,6 +494,159 @@ def futures_price(symbol):
             'oi': float(row.get('oi', 0)),
         })
     return jsonify(result)
+
+
+# ============ Paper Trading API ============
+PT_STATE_DIR = os.path.join(BASE_DIR, "strategies_quant")
+PT_SPECS_PATH = os.path.join(BASE_DIR, "strategies_quant", "contract_specs.py")
+
+# Strategy registry (must match paper_trading.py)
+PT_STRATEGIES = {
+    'V121': {'name': 'V121 Long-only', 'initial_cash': 500000},
+    'V121_DUAL': {'name': 'V121 Dual-Side', 'initial_cash': 500000},
+    'V121_MTF': {'name': 'V121 Multi-TF', 'initial_cash': 500000},
+}
+
+
+def _load_pt_state(strategy_id):
+    """加载指定策略的状态"""
+    p = os.path.join(PT_STATE_DIR, f'paper_trading_state_{strategy_id}.json')
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
+
+def _build_pt_response(state, strategy_id):
+    """构建单个策略的API响应"""
+    cfg = PT_STRATEGIES.get(strategy_id, {})
+    initial = cfg.get('initial_cash', state.get('initial_cash', 500000))
+    trades = state.get('trades', [])
+    daily_log = state.get('daily_log', [])
+    positions = state.get('open_positions', [])
+
+    equity_curve = [{'date': d['date'], 'equity': d['equity'], 'day_pnl': d.get('day_pnl', 0)} for d in daily_log]
+
+    monthly = {}
+    for d in daily_log:
+        ym = d['date'][:7]
+        if ym not in monthly:
+            monthly[ym] = {'start': d['equity'], 'end': d['equity']}
+        monthly[ym]['end'] = d['equity']
+    monthly_pnl = []
+    prev = initial
+    for ym in sorted(monthly):
+        r = (monthly[ym]['end'] / prev - 1) * 100 if prev > 0 else 0
+        monthly_pnl.append({'month': ym, 'return_pct': round(r, 2), 'equity': round(monthly[ym]['end'], 0)})
+        prev = monthly[ym]['end']
+
+    symbol_stats = {}
+    for t in trades:
+        s = t.get('sym', '')
+        if s not in symbol_stats:
+            symbol_stats[s] = {'name': t.get('name', s), 'trades': 0, 'wins': 0, 'pnl': 0}
+        symbol_stats[s]['trades'] += 1
+        if t.get('pnl_pct', 0) > 0: symbol_stats[s]['wins'] += 1
+        symbol_stats[s]['pnl'] += t.get('pnl_amount', 0)
+
+    mdd = 0
+    if equity_curve:
+        peak = equity_curve[0]['equity']
+        for e in equity_curve:
+            if e['equity'] > peak: peak = e['equity']
+            dd = (e['equity'] - peak) / peak * 100 if peak > 0 else 0
+            if dd < mdd: mdd = dd
+
+    wins = [t for t in trades if t.get('pnl_pct', 0) > 0]
+    wr = len(wins) / len(trades) * 100 if trades else 0
+    total_ret = (state['cash'] / initial - 1) * 100 if initial > 0 else 0
+    nd = len(daily_log)
+    ann_ret = ((state['cash'] / initial) ** (252 / max(nd, 1)) - 1) * 100 if initial > 0 and nd > 0 else 0
+
+    return {
+        'strategy_id': strategy_id,
+        'strategy_name': cfg.get('name', strategy_id),
+        'initialized': True,
+        'start_date': state.get('start_date', ''),
+        'last_date': state.get('last_date', ''),
+        'initial_capital': initial,
+        'cash': round(state.get('cash', 0), 2),
+        'high_water': round(state.get('high_water', 0), 2),
+        'total_return': round(total_ret, 2),
+        'annual_return': round(ann_ret, 2),
+        'mdd': round(mdd, 2),
+        'rm_ratio': round(abs(ann_ret / mdd), 2) if mdd != 0 else 0,
+        'total_trades': len(trades),
+        'win_rate': round(wr, 2),
+        'open_positions': positions,
+        'equity_curve': equity_curve,
+        'monthly_pnl': monthly_pnl,
+        'symbol_stats': sorted(symbol_stats.values(), key=lambda x: -x['pnl']),
+        'recent_trades': trades[-20:] if trades else [],
+    }
+
+
+@app.route('/api/paper-trading/status')
+def pt_status():
+    """模拟盘总览 — 返回所有策略"""
+    sid = request.args.get('strategy', None)
+    if sid:
+        state = _load_pt_state(sid)
+        if not state:
+            return jsonify({'error': f'strategy {sid} not found', 'initialized': False})
+        return jsonify(_build_pt_response(state, sid))
+
+    # Return all strategies summary
+    strategies = []
+    for sid, cfg in PT_STRATEGIES.items():
+        state = _load_pt_state(sid)
+        if state:
+            strategies.append(_build_pt_response(state, sid))
+        else:
+            strategies.append({'strategy_id': sid, 'strategy_name': cfg['name'], 'initialized': False})
+    return jsonify({'strategies': strategies})
+
+
+@app.route('/api/paper-trading/trades')
+def pt_trades():
+    """交易记录"""
+    sid = request.args.get('strategy', 'V121_DUAL')
+    state = _load_pt_state(sid)
+    if not state:
+        return jsonify([])
+    trades = state.get('trades', [])
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 50))
+    start = (page - 1) * per_page
+    return jsonify({
+        'trades': trades[start:start + per_page],
+        'total': len(trades),
+        'page': page,
+        'per_page': per_page,
+    })
+
+
+@app.route('/api/paper-trading/contract-specs')
+def pt_contract_specs():
+    """合约规格表"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("contract_specs", PT_SPECS_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        specs = {}
+        for code, (ex, mult, tick, mr, pu, name) in mod.CONTRACT_SPECS.items():
+            specs[code] = {
+                'exchange': ex, 'multiplier': mult, 'tick_size': tick,
+                'margin_rate': mr, 'price_unit': pu, 'name': name,
+                'tick_profit': tick * mult,
+            }
+        return jsonify(specs)
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 
 if __name__ == '__main__':

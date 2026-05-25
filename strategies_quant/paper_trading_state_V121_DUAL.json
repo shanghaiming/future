@@ -1,0 +1,11 @@
+{
+  "strategy_id": "V121_DUAL",
+  "strategy_name": "V121 Dual-Side",
+  "start_date": "2026-05-25",
+  "last_date": "2026-05-25",
+  "cash": 500000.0,
+  "high_water": 500000.0,
+  "open_positions": [],
+  "trades": [],
+  "daily_log": []
+}

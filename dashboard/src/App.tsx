@@ -48,7 +48,7 @@ function useApi<T>(url: string) {
 
 // ============ Chart Component ============
 // Uses useLayoutEffect to guarantee DOM dimensions exist before echarts.init
-function Chart({ option, height }: { option: object; height?: number }) {
+function Chart({ option, height }: { option: any; height?: number }) {
   const elRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<echarts.ECharts | null>(null)
   const roRef = useRef<ResizeObserver | null>(null)
@@ -61,7 +61,7 @@ function Chart({ option, height }: { option: object; height?: number }) {
       roRef.current = new ResizeObserver(() => chartRef.current?.resize())
       roRef.current.observe(el)
     }
-    try { chartRef.current.setOption(option, true) } catch {}
+    try { chartRef.current.setOption(option, { notMerge: true }) } catch {}
   })
 
   useEffect(() => () => {
@@ -416,26 +416,300 @@ function GreeksPage() {
 }
 
 // ============ Futures ============
+interface PriceBar { date: string; open: number; high: number; low: number; close: number; volume: number; oi: number }
+
 function FuturesPage() {
   const { data, loading } = useApi<FutSymbol[]>(`${API}/futures/symbols`)
+  const [selected, setSelected] = useState('')
+  const [priceData, setPriceData] = useState<PriceBar[]>([])
+  const [priceLoading, setPriceLoading] = useState(false)
+
+  useEffect(() => {
+    if (!selected) { setPriceData([]); return }
+    setPriceLoading(true)
+    fetch(`${API}/futures/price/${selected}`).then(r => r.json()).then(d => { setPriceData(d); setPriceLoading(false) }).catch(() => setPriceLoading(false))
+  }, [selected])
+
   if (loading || !data) return <Loading />
   const sorted = [...data].sort((a, b) => b.ret_5d - a.ret_5d)
+
+  // Build kline option
+  const dates = priceData.map(d => d.date)
+  const ohlc = priceData.map(d => [d.open, d.close, d.low, d.high])
+  const volumes = priceData.map(d => d.volume)
+  const oiVals = priceData.map(d => d.oi)
+  const klineOption = priceData.length > 0 ? {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, backgroundColor: 'rgba(17,24,39,0.95)', borderColor: '#1e3a5f', textStyle: { color: '#e0e0e0', fontSize: 11 },
+      formatter: (p: any) => {
+        if (!Array.isArray(p) || p.length === 0) return ''
+        const k = p[0]
+        const d = k.data
+        const idx = k.dataIndex
+        const dt = dates[idx]
+        const clr = d[1] >= d[0] ? '#ef5350' : '#26a69a'
+        return `<div style="font-size:12px"><b>${dt}</b><br/>` +
+          `开: ${d[0].toFixed(1)} 收: ${d[1].toFixed(1)}<br/>` +
+          `低: ${d[2].toFixed(1)} 高: ${d[3].toFixed(1)}<br/>` +
+          `<span style="color:${clr}">${d[1]>=d[0]?'↑':'↓'} ${((d[1]/d[0]-1)*100).toFixed(2)}%</span><br/>` +
+          `量: ${volumes[idx]?.toLocaleString()} OI: ${oiVals[idx]?.toLocaleString()}</div>`
+      }
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: [
+      { left: 70, right: 30, top: 20, height: '55%' },
+      { left: 70, right: 30, top: '72%', height: '12%' },
+      { left: 70, right: 30, top: '88%', height: '8%' },
+    ],
+    xAxis: [
+      { type: 'category', data: dates, gridIndex: 0, axisLabel: { show: false }, axisLine: { lineStyle: { color: '#1e3a5f' } }, splitLine: { show: false } },
+      { type: 'category', data: dates, gridIndex: 1, axisLabel: { show: false }, axisLine: { lineStyle: { color: '#1e3a5f' } } },
+      { type: 'category', data: dates, gridIndex: 2, axisLabel: { color: '#78909c', fontSize: 9 }, axisLine: { lineStyle: { color: '#1e3a5f' } } },
+    ],
+    yAxis: [
+      { type: 'value', gridIndex: 0, scale: true, axisLabel: { color: '#78909c' }, splitLine: { lineStyle: { color: '#1e3a5f', type: 'dashed' } } },
+      { type: 'value', gridIndex: 1, axisLabel: { color: '#78909c', formatter: (v: number) => (v/10000).toFixed(0) + '万' }, splitLine: { show: false } },
+      { type: 'value', gridIndex: 2, axisLabel: { color: '#78909c', formatter: (v: number) => (v/10000).toFixed(0) + '万' }, splitLine: { show: false } },
+    ],
+    dataZoom: [
+      { type: 'inside', xAxisIndex: [0, 1, 2], start: Math.max(0, 100 - 120 / priceData.length * 100), end: 100 },
+    ],
+    series: [
+      { name: 'K线', type: 'candlestick', data: ohlc, xAxisIndex: 0, yAxisIndex: 0,
+        itemStyle: { color: '#ef5350', color0: '#26a69a', borderColor: '#ef5350', borderColor0: '#26a69a' },
+      },
+      { name: '成交量', type: 'bar', data: volumes.map((v, i) => ({ value: v, itemStyle: { color: ohlc[i][1] >= ohlc[i][0] ? 'rgba(239,83,80,0.5)' : 'rgba(38,166,154,0.5)' } })), xAxisIndex: 1, yAxisIndex: 1 },
+      { name: '持仓量', type: 'line', data: oiVals, xAxisIndex: 2, yAxisIndex: 2, smooth: true, lineStyle: { color: '#ffc107', width: 1 }, symbol: 'none' },
+    ],
+  } : null
+
+  const selInfo = data.find(d => d.symbol === selected)
+
   return (
-    <div className="card">
-      <div className="card-header"><span className="card-title">期货品种</span><span className="card-badge">{data.length}</span></div>
-      <div className="scroll-table"><table><thead><tr><th>品种</th><th>收盘</th><th>5日%</th><th>20日%</th><th>波动率</th><th>成交量</th><th>持仓量</th></tr></thead>
-      <tbody>{sorted.map(r => (
-        <tr key={r.symbol}><td style={{ fontWeight: 600 }}>{r.symbol}</td><td>{r.close.toFixed(2)}</td>
-        <td className={r.ret_5d >= 0 ? 'up' : 'down'}>{r.ret_5d >= 0 ? '+' : ''}{r.ret_5d.toFixed(2)}%</td>
-        <td className={r.ret_20d >= 0 ? 'up' : 'down'}>{r.ret_20d >= 0 ? '+' : ''}{r.ret_20d.toFixed(2)}%</td>
-        <td>{r.vol_20d.toFixed(1)}%</td><td>{r.volume?.toLocaleString()}</td><td>{r.oi?.toLocaleString()}</td></tr>
-      ))}</tbody></table></div>
+    <div style={{ display: 'flex', gap: 12 }}>
+      {/* Left: symbol list */}
+      <div style={{ width: 200, flexShrink: 0, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, maxHeight: 'calc(100vh - 180px)', overflowY: 'auto' }}>
+        <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontSize: 12, color: '#4fc3f7', fontWeight: 600 }}>品种 ({data.length})</div>
+        {sorted.map(r => (
+          <div key={r.symbol} onClick={() => setSelected(r.symbol)}
+            style={{ padding: '5px 10px', cursor: 'pointer', fontSize: 11, transition: 'background 0.1s',
+              background: selected === r.symbol ? 'rgba(79,195,247,0.15)' : 'transparent',
+              borderLeft: selected === r.symbol ? '3px solid #4fc3f7' : '3px solid transparent',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            }}>
+            <span style={{ fontWeight: selected === r.symbol ? 600 : 400, color: selected === r.symbol ? '#4fc3f7' : '#e0e0e0' }}>{r.symbol}</span>
+            <span style={{ color: r.ret_5d >= 0 ? '#ef5350' : '#26a69a', fontSize: 10 }}>{r.ret_5d >= 0 ? '+' : ''}{r.ret_5d.toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+      {/* Right: kline chart */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {selected ? (
+          <div className="card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div>
+                <span style={{ fontSize: 15, color: '#4fc3f7', fontWeight: 600 }}>{selected}</span>
+                {selInfo && <span style={{ marginLeft: 12, fontSize: 20, fontWeight: 700, color: selInfo.ret_5d >= 0 ? '#ef5350' : '#26a69a' }}>{selInfo.close.toFixed(2)}</span>}
+                {selInfo && <span style={{ marginLeft: 8, fontSize: 13, color: selInfo.ret_5d >= 0 ? '#ef5350' : '#26a69a' }}>{selInfo.ret_5d >= 0 ? '+' : ''}{selInfo.ret_5d.toFixed(2)}%</span>}
+              </div>
+              {selInfo && <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#78909c' }}>
+                <span>20日 {selInfo.ret_20d >= 0 ? '+' : ''}{selInfo.ret_20d.toFixed(1)}%</span>
+                <span>波动 {selInfo.vol_20d.toFixed(1)}%</span>
+                <span>量 {selInfo.volume?.toLocaleString()}</span>
+                <span>OI {selInfo.oi?.toLocaleString()}</span>
+              </div>}
+            </div>
+            {priceLoading ? <Loading /> : klineOption ? <Chart height={600} option={klineOption} /> : <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-dim)' }}>无数据</div>}
+          </div>
+        ) : (
+          <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 400, color: 'var(--text-dim)' }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 16, marginBottom: 8 }}>点击左侧品种查看K线</div>
+              <div style={{ fontSize: 12 }}>共 {data.length} 个品种</div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+// ============ Paper Trading ============
+interface PTStatus {
+  strategy_id: string; strategy_name: string;
+  initialized: boolean; start_date: string; last_date: string;
+  initial_capital: number; cash: number; high_water: number;
+  total_return: number; annual_return: number; mdd: number; rm_ratio: number;
+  total_trades: number; win_rate: number;
+  open_positions: { sym: string; name: string; entry_date: string; entry_price: number; lots: number; sig: string; dir?: number; margin_rate?: number }[];
+  equity_curve: { date: string; equity: number; day_pnl: number }[];
+  monthly_pnl: { month: string; return_pct: number; equity: number }[];
+  symbol_stats: { name: string; trades: number; wins: number; pnl: number }[];
+  recent_trades: { close_date: string; name: string; entry_date: string; entry_price: number; exit_price: number; pnl_pct: number; pnl_amount: number; lots: number; sig: string; dir?: number; margin?: number; margin_rate?: number }[];
+  error?: string;
+}
+
+interface PTAllStatus {
+  strategies: PTStatus[]
+}
+
+function PaperTradingPage() {
+  const { data, loading } = useApi<PTAllStatus>(`${API}/paper-trading/status`)
+  const [selectedStrategy, setSelectedStrategy] = useState('V121_DUAL')
+
+  if (loading) return <Loading />
+  if (!data || !data.strategies) return (
+    <div className="card" style={{ textAlign: 'center', padding: 40 }}>
+      <div style={{ fontSize: 16, color: 'var(--text-dim)' }}>模拟盘未创建</div>
+      <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>运行 python paper_trading.py --create V121_DUAL</div>
+    </div>
+  )
+
+  const strategies = data.strategies
+  const selected = strategies.find((s: PTStatus) => s.strategy_id === selectedStrategy) || strategies[0]
+  if (!selected || !selected.initialized) return (
+    <div className="card" style={{ textAlign: 'center', padding: 40 }}>
+      <div style={{ fontSize: 16, color: 'var(--text-dim)' }}>策略 {selectedStrategy} 未创建</div>
+    </div>
+  )
+
+  const eq = selected.equity_curve
+  const posColor = selected.total_return >= 0 ? 'var(--red)' : 'var(--green)'
+
+  return (
+    <div>
+      {/* Strategy tabs */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        {strategies.map((s: PTStatus) => (
+          <div key={s.strategy_id} onClick={() => setSelectedStrategy(s.strategy_id)}
+            style={{ padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 600, transition: 'all 0.15s',
+              background: selectedStrategy === s.strategy_id ? 'rgba(79,195,247,0.15)' : 'var(--bg-card)',
+              border: `1px solid ${selectedStrategy === s.strategy_id ? '#4fc3f7' : 'var(--border)'}`,
+              color: selectedStrategy === s.strategy_id ? '#4fc3f7' : '#78909c',
+            }}>
+            {s.strategy_name || s.strategy_id}
+            {s.initialized && <span style={{ marginLeft: 8, fontSize: 11, color: s.total_return >= 0 ? '#ef5350' : '#26a69a' }}>
+              {s.total_return >= 0 ? '+' : ''}{s.total_return.toFixed(1)}%
+            </span>}
+          </div>
+        ))}
+      </div>
+
+      {/* Stats */}
+      <div className="grid-4">
+        <div className="stat-card">
+          <div className="stat-label">总收益</div>
+          <div className="stat-value" style={{ color: posColor }}>{selected.total_return >= 0 ? '+' : ''}{selected.total_return.toFixed(1)}%</div>
+          <div className="stat-sub">{((selected.cash - selected.initial_capital) / 10000).toFixed(1)}万元</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">年化</div>
+          <div className="stat-value" style={{ color: posColor }}>{selected.annual_return >= 0 ? '+' : ''}{selected.annual_return.toFixed(1)}%</div>
+          <div className="stat-sub">R/M={selected.rm_ratio.toFixed(2)}</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">最大回撤</div>
+          <div className="stat-value" style={{ color: 'var(--green)' }}>{selected.mdd.toFixed(1)}%</div>
+          <div className="stat-sub">MDD</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">胜率</div>
+          <div className="stat-value">{selected.win_rate.toFixed(1)}%</div>
+          <div className="stat-sub">{selected.total_trades}笔</div>
+        </div>
+      </div>
+
+      {/* Equity Curve + Monthly */}
+      <div className="grid-2" style={{ marginTop: 16 }}>
+        <div className="card">
+          <div style={{ marginBottom: 8, fontSize: 13, color: '#4fc3f7', fontWeight: 600 }}>
+            权益曲线 <span style={{ color: '#78909c', fontSize: 11 }}>({selected.start_date} ~ {selected.last_date})</span>
+          </div>
+          {eq.length > 0 && <Chart height={320} option={{
+            tooltip: { trigger: 'axis', formatter: (p: any) => `${p[0].axisValue}<br/>权益: ${p[0].data?.toLocaleString()}元` },
+            xAxis: { type: 'category', data: eq.map(e => e.date), axisLabel: { color: '#78909c', fontSize: 9 } },
+            yAxis: { type: 'value', axisLabel: { color: '#78909c', formatter: (v: number) => (v/10000).toFixed(0) + '万' }, splitLine: { lineStyle: { color: '#1e3a5f' } } },
+            series: [{ type: 'line', data: eq.map(e => e.equity), smooth: true, lineStyle: { color: '#4fc3f7', width: 2 },
+              areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(79,195,247,0.2)' }, { offset: 1, color: 'rgba(0,0,0,0)' }] } },
+              markLine: { data: [{ yAxis: selected.initial_capital, lineStyle: { color: '#78909c', type: 'dashed' } }], label: { show: false } } }],
+            grid: { left: 70, right: 16, top: 10, bottom: 30 },
+          }} />}
+        </div>
+        <div className="card">
+          <div style={{ marginBottom: 8, fontSize: 13, color: '#4fc3f7', fontWeight: 600 }}>月度收益</div>
+          {selected.monthly_pnl.length > 0 && <Chart height={320} option={{
+            tooltip: { trigger: 'axis', formatter: (p: any) => `${p[0].axisValue}<br/>${p[0].data >= 0 ? '+' : ''}${p[0].data.toFixed(1)}%` },
+            xAxis: { type: 'category', data: selected.monthly_pnl.map(m => m.month), axisLabel: { color: '#78909c', fontSize: 9, rotate: 30 } },
+            yAxis: { type: 'value', axisLabel: { color: '#78909c', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#1e3a5f' } } },
+            series: [{ type: 'bar', data: selected.monthly_pnl.map(m => ({ value: m.return_pct, itemStyle: { color: m.return_pct >= 0 ? '#ef5350' : '#26a69a' } })) }],
+            grid: { left: 50, right: 16, top: 10, bottom: 40 },
+          }} />}
+        </div>
+      </div>
+
+      {/* Open Positions + Symbol Stats */}
+      <div className="grid-2" style={{ marginTop: 16 }}>
+        <div className="card">
+          <div className="card-header"><span className="card-title">当前持仓</span><span className="card-badge">{selected.open_positions.length}</span></div>
+          {selected.open_positions.length > 0 ? (
+            <div className="scroll-table" style={{ maxHeight: 300 }}>
+              <table><thead><tr><th>方向</th><th>品种</th><th>入场日</th><th>价格</th><th>手数</th><th>信号</th></tr></thead>
+              <tbody>{selected.open_positions.map((p, i) => (
+                <tr key={i}>
+                  <td style={{ color: (p.dir || 1) === 1 ? '#ef5350' : '#26a69a', fontWeight: 600 }}>{(p.dir || 1) === 1 ? '多' : '空'}</td>
+                  <td style={{ fontWeight: 600 }}>{p.name}</td>
+                  <td>{p.entry_date}</td>
+                  <td>{p.entry_price.toFixed(1)}</td>
+                  <td>{p.lots}</td>
+                  <td><span className="tag tag-neutral">{p.sig}</span></td>
+                </tr>
+              ))}</tbody></table>
+            </div>
+          ) : <div style={{ padding: 20, textAlign: 'center', color: 'var(--text-dim)' }}>无持仓</div>}
+        </div>
+        <div className="card">
+          <div className="card-header"><span className="card-title">品种盈亏</span><span className="card-badge">{selected.symbol_stats.length}</span></div>
+          <div className="scroll-table" style={{ maxHeight: 300 }}>
+            <table><thead><tr><th>品种</th><th>笔数</th><th>胜率</th><th>累计盈亏</th></tr></thead>
+            <tbody>{selected.symbol_stats.slice(0, 15).map((s, i) => {
+              const wr = s.trades > 0 ? (s.wins / s.trades * 100) : 0
+              return <tr key={i}>
+                <td style={{ fontWeight: 600 }}>{s.name}</td>
+                <td>{s.trades}</td>
+                <td className={wr >= 50 ? 'up' : 'down'}>{wr.toFixed(0)}%</td>
+                <td className={s.pnl >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>{s.pnl >= 0 ? '+' : ''}{s.pnl.toLocaleString(undefined, {maximumFractionDigits: 0})}元</td>
+              </tr>
+            })}</tbody></table>
+          </div>
+        </div>
+      </div>
+
+      {/* Recent Trades */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="card-header"><span className="card-title">最近交易</span><span className="card-badge">{selected.recent_trades.length}</span></div>
+        <div className="scroll-table" style={{ maxHeight: 350 }}>
+          <table><thead><tr><th>方向</th><th>平仓日</th><th>品种</th><th>入场日</th><th>入场</th><th>平仓</th><th>盈亏%</th><th>盈亏</th><th>信号</th></tr></thead>
+          <tbody>{[...selected.recent_trades].reverse().map((t, i) => (
+            <tr key={i}>
+              <td style={{ color: (t.dir || 1) === 1 ? '#ef5350' : '#26a69a', fontWeight: 600 }}>{(t.dir || 1) === 1 ? '多' : '空'}</td>
+              <td>{t.close_date}</td>
+              <td style={{ fontWeight: 600 }}>{t.name}</td>
+              <td>{t.entry_date}</td>
+              <td>{t.entry_price.toFixed(1)}</td>
+              <td>{t.exit_price.toFixed(1)}</td>
+              <td className={t.pnl_pct >= 0 ? 'up' : 'down'}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(1)}%</td>
+              <td className={t.pnl_amount >= 0 ? 'up' : 'down'} style={{ fontWeight: 600 }}>{t.pnl_amount >= 0 ? '+' : ''}{t.pnl_amount.toLocaleString(undefined, {maximumFractionDigits: 0})}</td>
+              <td><span className="tag tag-neutral">{t.sig}</span></td>
+            </tr>
+          ))}</tbody></table>
+        </div>
+      </div>
     </div>
   )
 }
 
 // ============ App ============
-type Page = 'overview' | 'ts' | 'options' | 'greeks' | 'futures'
+type Page = 'overview' | 'ts' | 'options' | 'greeks' | 'futures' | 'paper'
 
 function App() {
   const [page, setPage] = useState<Page>('overview')
@@ -443,10 +717,11 @@ function App() {
     { key: 'overview', label: '总览' }, { key: 'ts', label: '期限结构' },
     { key: 'options', label: '波动率' }, { key: 'greeks', label: 'Greeks' },
     { key: 'futures', label: '期货' },
+    { key: 'paper', label: '模拟盘' },
   ]
   return (
     <>
-      <div className="header"><div><h1>Futures Analytics</h1><div className="subtitle">期限结构 | 波动率 | Greeks | 期货行情</div></div>
+      <div className="header"><div><h1>Futures Analytics</h1><div className="subtitle">期限结构 | 波动率 | Greeks | 期货行情 | 模拟盘</div></div>
         <div className="header-right"><span><span className="status-dot" />Live</span></div></div>
       <div className="nav">{tabs.map(t => (
         <div key={t.key} className={`nav-item ${page === t.key ? 'active' : ''}`} onClick={() => setPage(t.key)}>{t.label}</div>
@@ -457,6 +732,7 @@ function App() {
         {page === 'options' && <OptionsPage />}
         {page === 'greeks' && <GreeksPage />}
         {page === 'futures' && <FuturesPage />}
+        {page === 'paper' && <PaperTradingPage />}
       </div>
     </>
   )

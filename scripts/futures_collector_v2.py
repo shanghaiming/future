@@ -115,24 +115,31 @@ def fetch_eastmoney_kline(symbol, market='159', klt='101', lmt=500):
         return None
 
 
-def save_data(df, symbol, data_type='futures_weighted'):
-    """保存数据到对应目录"""
+def save_data(df, symbol, data_type='futures_daily'):
+    """保存数据到对应目录
+    注意: 东财数据保存到 futures_daily，不要写 futures_weighted（tqsdk专属）
+    """
     save_dir = os.path.join(DATA_DIR, data_type)
     os.makedirs(save_dir, exist_ok=True)
-    
+
     filepath = os.path.join(save_dir, f"{symbol.lower()}.csv")
-    
+
+    # 统一日期格式为 YYYYMMDD
+    df['trade_date'] = df['trade_date'].astype(str).str.replace('-', '')
+
     # 如果已有数据，合并去重
     if os.path.exists(filepath):
-        existing = pd.read_csv(filepath)
-        combined = pd.concat([existing, df]).drop_duplicates(subset=['trade_date'])
-        combined = combined.sort_values('trade_date')
+        existing = pd.read_csv(filepath, dtype=str)
+        existing['trade_date'] = existing['trade_date'].astype(str).str.replace('-', '')
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=['trade_date'], keep='last')
+        combined = combined.sort_values('trade_date', ascending=False)
         combined.to_csv(filepath, index=False)
         new_rows = len(combined) - len(existing)
     else:
         df.to_csv(filepath, index=False)
         new_rows = len(df)
-    
+
     return new_rows
 
 
@@ -151,7 +158,7 @@ def collect_weighted_data():
         df = fetch_eastmoney_kline(symbol)
         
         if df is not None and not df.empty:
-            new_rows = save_data(df, symbol, 'futures_weighted')
+            new_rows = save_data(df, symbol, 'futures_daily')
             log(f"  ✓ {symbol}: {len(df)}条, 新增{new_rows}条")
             success += 1
         else:

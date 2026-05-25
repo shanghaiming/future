@@ -164,10 +164,10 @@ def incremental_update(filepath, new_df, symbol):
         return len(new_df)
 
     old_df = pd.read_csv(filepath, dtype=str)
-    old_df["trade_date"] = old_df["trade_date"].astype(str)
+    old_df["trade_date"] = old_df["trade_date"].astype(str).str.replace("-", "")
 
     new_df = new_df.copy()
-    new_df["trade_date"] = new_df["trade_date"].astype(str)
+    new_df["trade_date"] = new_df["trade_date"].astype(str).str.replace("-", "")
 
     combined = pd.concat([old_df, new_df], ignore_index=True)
     combined = combined.drop_duplicates(subset=["trade_date"], keep="last")
