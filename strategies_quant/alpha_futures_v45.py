@@ -4,13 +4,15 @@ V45: ULTIMATE MULTI-LAYER STRATEGY
 FINAL synthesis combining ALL proven improvements:
 
 Layer 1 (V27): Multi-timeframe rank confirmation
-  - Short-term (5d) composite: 7 factors, V18 weights
-  - Medium-term (20d) composite: same factors, 20d lookback
+  - Short-term (5d) composite: 4 ST factors
+  - Medium-term (20d) composite: 3 MT factors
   - Combined = st_weight * ST + (1-st_weight) * MT
+  - Entry requires BOTH ST and MT above min_rank (lower than adaptive threshold)
 
 Layer 2 (V39): Adaptive threshold
   - Rolling win rate over 20 trades
   - Dynamic threshold: base +/- adapt_amount
+  - Applied to the COMBINED composite
 
 Layer 3 (V40): Breadth filter
   - A/D ratio < max_ad (market broadly oversold)
@@ -55,17 +57,6 @@ except ImportError:
 CASH0 = 1_000_000
 COMM = 0.0005
 
-# V18 weights for single-timeframe composite
-DEFAULT_WEIGHTS = {
-    'rank_ret5d':  0.25,
-    'rank_oi5d':   0.20,
-    'rank_rsi':    0.15,
-    'rank_vol':    0.15,
-    'rank_ret10d': 0.10,
-    'rank_range':  0.10,
-    'rank_atrp':   0.05,
-}
-
 # Multi-timeframe weights (from V27)
 ST_WEIGHTS = {
     'rank_ret5d':  0.30,
@@ -78,6 +69,17 @@ MT_WEIGHTS = {
     'rank_ret20d': 0.40,
     'rank_oi20d':  0.35,
     'rank_vol20d':  0.25,
+}
+
+# V18 weights for single-TF mode (ablation)
+DEFAULT_WEIGHTS = {
+    'rank_ret5d':  0.25,
+    'rank_oi5d':   0.20,
+    'rank_rsi':    0.15,
+    'rank_vol':    0.15,
+    'rank_ret10d': 0.10,
+    'rank_range':  0.10,
+    'rank_atrp':   0.05,
 }
 
 
@@ -130,7 +132,7 @@ def compute_rsi_manual(C: np.ndarray, NS: int, ND: int,
 
 
 # ============================================================
-# RAW FACTOR COMPUTATION (single-timeframe, V18-style + 10d/20d)
+# RAW FACTOR COMPUTATION
 # ============================================================
 def compute_raw_factors(C: np.ndarray, O: np.ndarray, H: np.ndarray,
                         L: np.ndarray, V: np.ndarray, OI: np.ndarray,
@@ -269,40 +271,31 @@ def compute_cross_sectional_ranks(
     t0 = time.time()
     print("[V45] Computing cross-sectional ranks...", flush=True)
 
-    # Single-timeframe factors (V18-style)
-    single_tf = {
+    # All unique factors needed across MTF and single-TF modes
+    all_factors = {
         'rank_ret5d': raw_factors['ret_5d'],
         'rank_ret10d': raw_factors['ret_10d'],
+        'rank_ret20d': raw_factors['ret_20d'],
         'rank_oi5d': raw_factors['oi_5d'],
+        'rank_oi20d': raw_factors['oi_20d'],
         'rank_vol': raw_factors['vol_5d'],
+        'rank_vol5d': raw_factors['vol_5d'],
+        'rank_vol20d': raw_factors['vol_20d'],
         'rank_range': raw_factors['daily_range'],
         'rank_rsi': raw_factors['rsi14'],
+        'rank_rsi5d': raw_factors['rsi5'],
         'rank_atrp': raw_factors['atrp'],
     }
 
-    # Multi-timeframe factors (V27-style)
-    multi_tf = {
-        'rank_ret5d': raw_factors['ret_5d'],
-        'rank_oi5d': raw_factors['oi_5d'],
-        'rank_rsi5d': raw_factors['rsi5'],
-        'rank_vol5d': raw_factors['vol_5d'],
-        'rank_ret20d': raw_factors['ret_20d'],
-        'rank_oi20d': raw_factors['oi_20d'],
-        'rank_vol20d': raw_factors['vol_20d'],
-    }
-
-    all_factors = {**single_tf, **multi_tf}
-
+    # Factors to invert: low raw value -> high rank (most oversold)
     INVERT_FACTORS = {
-        'rank_ret5d', 'rank_ret10d', 'rank_oi5d', 'rank_rsi',
-        'rank_rsi5d', 'rank_ret20d', 'rank_oi20d',
+        'rank_ret5d', 'rank_ret10d', 'rank_ret20d',
+        'rank_oi5d', 'rank_oi20d',
+        'rank_rsi', 'rank_rsi5d',
     }
 
     ranks = {}
     for name, factor in all_factors.items():
-        # Skip duplicates already computed
-        if name in ranks:
-            continue
         rank_arr = np.full((NS, ND), np.nan)
         for di in range(ND):
             vals = factor[:, di]
@@ -342,43 +335,6 @@ def compute_ker(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
 
 
 # ============================================================
-# SINGLE-TF COMPOSITE (V18-style, for non-MTF mode)
-# ============================================================
-def build_single_tf_composite(ranks: Dict[str, np.ndarray],
-                               weights: Dict[str, float],
-                               NS: int, ND: int,
-                               min_factors: int = 4) -> Tuple[np.ndarray, np.ndarray]:
-    t0 = time.time()
-    print("[V45] Building single-TF composite...", flush=True)
-
-    composite = np.full((NS, ND), np.nan)
-    n_confirm = np.zeros((NS, ND), dtype=int)
-
-    factor_names = list(weights.keys())
-    weight_vals = np.array([weights[k] for k in factor_names])
-
-    for di in range(ND):
-        for si in range(NS):
-            vals = []
-            w_sum = 0.0
-            confirm_count = 0
-            for idx, name in enumerate(factor_names):
-                rank_val = ranks[name][si, di]
-                if np.isnan(rank_val):
-                    continue
-                vals.append(rank_val * weight_vals[idx])
-                w_sum += weight_vals[idx]
-                if rank_val > 0.5:
-                    confirm_count += 1
-            if w_sum > 0 and confirm_count >= min_factors:
-                composite[si, di] = sum(vals) / w_sum
-                n_confirm[si, di] = confirm_count
-
-    print(f"  Single-TF done: {time.time() - t0:.1f}s", flush=True)
-    return composite, n_confirm
-
-
-# ============================================================
 # MULTI-TF COMPOSITE (V27-style)
 # ============================================================
 def build_multi_tf_signal(ranks: Dict[str, np.ndarray],
@@ -389,8 +345,6 @@ def build_multi_tf_signal(ranks: Dict[str, np.ndarray],
                           min_factors: int = 2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     t0 = time.time()
     print(f"[V45] Building multi-TF signal (st_w={st_weight:.2f})...", flush=True)
-
-    mt_weight = 1.0 - st_weight
 
     composite = np.full((NS, ND), np.nan)
     st_comp = np.full((NS, ND), np.nan)
@@ -433,13 +387,50 @@ def build_multi_tf_signal(ranks: Dict[str, np.ndarray],
             if mt_wsum > 0 and mt_confirm >= min_factors:
                 mt_comp[si, di] = sum(mt_vals) / mt_wsum
 
-            # Combined composite
+            # Combined composite: only when both timeframes available
             if not np.isnan(st_comp[si, di]) and not np.isnan(mt_comp[si, di]):
                 composite[si, di] = (st_weight * st_comp[si, di] +
-                                     mt_weight * mt_comp[si, di])
+                                     (1.0 - st_weight) * mt_comp[si, di])
 
     print(f"  Multi-TF done: {time.time() - t0:.1f}s", flush=True)
     return composite, st_comp, mt_comp
+
+
+# ============================================================
+# SINGLE-TF COMPOSITE (V18-style, for ablation)
+# ============================================================
+def build_single_tf_composite(ranks: Dict[str, np.ndarray],
+                               weights: Dict[str, float],
+                               NS: int, ND: int,
+                               min_factors: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+    t0 = time.time()
+    print("[V45] Building single-TF composite...", flush=True)
+
+    composite = np.full((NS, ND), np.nan)
+    n_confirm = np.zeros((NS, ND), dtype=int)
+
+    factor_names = list(weights.keys())
+    weight_vals = np.array([weights[k] for k in factor_names])
+
+    for di in range(ND):
+        for si in range(NS):
+            vals = []
+            w_sum = 0.0
+            confirm_count = 0
+            for idx, name in enumerate(factor_names):
+                rank_val = ranks[name][si, di]
+                if np.isnan(rank_val):
+                    continue
+                vals.append(rank_val * weight_vals[idx])
+                w_sum += weight_vals[idx]
+                if rank_val > 0.5:
+                    confirm_count += 1
+            if w_sum > 0 and confirm_count >= min_factors:
+                composite[si, di] = sum(vals) / w_sum
+                n_confirm[si, di] = confirm_count
+
+    print(f"  Single-TF done: {time.time() - t0:.1f}s", flush=True)
+    return composite, n_confirm
 
 
 # ============================================================
@@ -451,7 +442,6 @@ def compute_market_breadth(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
     print("[V45] Computing market breadth...", flush=True)
 
     ad_ratio = np.full(ND, np.nan)
-
     for di in range(20, ND):
         rets = []
         for si in range(NS):
@@ -482,42 +472,33 @@ def adaptive_threshold(
     window = recent_trades_win[-win_rate_window:]
     win_rate = sum(window) / len(window)
     if win_rate > 0.60:
-        threshold = base_threshold - adapt_amount
+        return max(min_cap, base_threshold - adapt_amount)
     elif win_rate < 0.50:
-        threshold = base_threshold + adapt_amount
-    else:
-        threshold = base_threshold
-    return max(min_cap, min(max_cap, threshold))
+        return min(max_cap, base_threshold + adapt_amount)
+    return base_threshold
 
 
 # ============================================================
 # TAIL RISK PROTECTION (V38-style)
 # ============================================================
-def compute_size_multiplier(
-    consecutive_losses: int,
-    loss_reduce: int,
-    loss_pause: int,
-) -> float:
-    """Progressive size reduction based on consecutive losses."""
+def compute_size_multiplier(consecutive_losses: int,
+                            loss_reduce: int,
+                            loss_pause: int) -> float:
     if consecutive_losses >= loss_pause:
-        return 0.0   # paused
+        return 0.0
     elif consecutive_losses >= loss_reduce:
-        return 0.5   # reduced
-    return 1.0       # full size
+        return 0.5
+    return 1.0
 
 
 # ============================================================
-# SIGNAL PIPELINE
+# SIGNAL COMPUTATION PIPELINE
 # ============================================================
-def compute_all_signals(
-    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
-    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
-    use_mtf: bool = True,
-    st_weight: float = 0.60,
-    use_breadth: bool = True,
-    max_ad: float = 0.45,
+def compute_signals(
+    C, O, H, L, V, OI, NS, ND,
+    use_mtf=True, st_weight=0.60,
 ) -> Dict:
-    """Full signal pipeline with all layers."""
+    """Compute signals once. Stores all layers' data."""
     raw = compute_raw_factors(C, O, H, L, V, OI, NS, ND)
     ranks = compute_cross_sectional_ranks(raw, NS, ND)
     ker_regime = compute_ker(C, NS, ND)
@@ -526,7 +507,8 @@ def compute_all_signals(
     if use_mtf:
         composite, st_comp, mt_comp = build_multi_tf_signal(
             ranks, ST_WEIGHTS, MT_WEIGHTS, st_weight, NS, ND)
-        n_confirm = np.full((NS, ND), 0, dtype=int)
+        # n_confirm not used in MTF mode (MTF has its own confirmation)
+        n_confirm = np.full((NS, ND), 4, dtype=int)
     else:
         composite, n_confirm = build_single_tf_composite(
             ranks, DEFAULT_WEIGHTS, NS, ND)
@@ -563,23 +545,23 @@ def compute_atr_at(H, L, C, si, di, start_di):
 # ============================================================
 def backtest_v45(
     C, O, H, L, NS, ND, dates, syms, sigs,
-    # Layer 1: MTF
+    # Layer toggles
     use_mtf: bool = True,
-    # Layer 2: Adaptive threshold
     use_adaptive: bool = True,
+    use_breadth: bool = True,
+    use_tail_risk: bool = True,
+    # Layer 2: Adaptive threshold
     base_threshold: float = 0.80,
     adapt_amount: float = 0.05,
     win_rate_window: int = 20,
     min_cap: float = 0.70,
     max_cap: float = 0.95,
     # Layer 3: Breadth
-    use_breadth: bool = True,
     max_ad: float = 0.45,
     # Layer 4: Tail risk
-    use_tail_risk: bool = True,
     loss_reduce: int = 3,
     loss_pause: int = 5,
-    # Layer 5: Standard params
+    # Layer 5: Standard
     top_n: int = 1,
     atr_stop: float = 3.0,
     min_confidence: int = 3,
@@ -589,7 +571,6 @@ def backtest_v45(
     pyramid_day: int = 1,
     start_di: int = 60,
     end_di: Optional[int] = None,
-    # State for walk-forward continuity
     trade_state: Optional[Dict] = None,
 ):
     """Backtest V45 with all layers toggleable."""
@@ -609,7 +590,7 @@ def backtest_v45(
     positions = []
     trades = []
 
-    # Adaptive threshold state
+    # State for adaptive + tail risk
     if isinstance(trade_state, dict):
         recent_trades_win = list(trade_state.get('recent_trades_win', []))
         consecutive_losses = trade_state.get('consecutive_losses', 0)
@@ -617,12 +598,16 @@ def backtest_v45(
         recent_trades_win = []
         consecutive_losses = 0
 
+    # MTF sub-threshold: always lower than the main threshold to ensure
+    # the MTF layer acts as a confirmation filter, not a blocker
+    mtf_sub_threshold = 0.60  # Fixed: both ST and MT must exceed this
+
     for di in range(max(start_di, 1), end_di):
         d = dates[di]
         daily_pnl = 0.0
         new_positions = []
 
-        # Compute current threshold (adaptive or static)
+        # Compute current adaptive threshold
         if use_adaptive:
             current_threshold = adaptive_threshold(
                 recent_trades_win, base_threshold, adapt_amount,
@@ -651,10 +636,9 @@ def backtest_v45(
 
             earliest_edi = min(p[0] for p in pos_list)
             hold = di - earliest_edi
-
             stopped = any(c < sp for _, _, sp, _, _ in pos_list)
 
-            if stopped:
+            if stopped or hold >= hold_days:
                 total_pnl = 0.0
                 for edi, ep, sp, alloc, is_pyr in pos_list:
                     pnl = (c - ep) / ep - COMM
@@ -664,25 +648,9 @@ def backtest_v45(
                     trades.append({
                         'pnl_abs': profit, 'pnl_pct': pnl * 100,
                         'days': di - edi + 1, 'di': di, 'year': d.year,
-                        'sym': syms[si], 'reason': 'stop', 'pyr': is_pyr,
-                    })
-                is_win = 1 if total_pnl > 0 else 0
-                recent_trades_win.append(is_win)
-                if is_win:
-                    consecutive_losses = 0
-                else:
-                    consecutive_losses += 1
-            elif hold >= hold_days:
-                total_pnl = 0.0
-                for edi, ep, sp, alloc, is_pyr in pos_list:
-                    pnl = (c - ep) / ep - COMM
-                    profit = equity * alloc * pnl
-                    daily_pnl += profit
-                    total_pnl += pnl
-                    trades.append({
-                        'pnl_abs': profit, 'pnl_pct': pnl * 100,
-                        'days': di - edi + 1, 'di': di, 'year': d.year,
-                        'sym': syms[si], 'reason': 'hold', 'pyr': is_pyr,
+                        'sym': syms[si],
+                        'reason': 'stop' if stopped else 'hold',
+                        'pyr': is_pyr,
                     })
                 is_win = 1 if total_pnl > 0 else 0
                 recent_trades_win.append(is_win)
@@ -738,7 +706,7 @@ def backtest_v45(
         if size_mult <= 0.01:
             continue
 
-        # LAYER 3: Breadth filter
+        # LAYER 3: Breadth filter -- only trade when market is oversold
         if use_breadth:
             if np.isnan(ad_ratio[di]) or ad_ratio[di] >= max_ad:
                 continue
@@ -750,15 +718,16 @@ def backtest_v45(
                 continue
             if np.isnan(composite[si, di]):
                 continue
-            # Adaptive threshold
+
+            # Combined composite must exceed adaptive threshold
             if composite[si, di] < current_threshold:
                 continue
 
-            # MTF confirmation: both ST and MT must exceed threshold
+            # LAYER 1: MTF confirmation (lower sub-threshold, not adaptive)
             if use_mtf and st_comp is not None and mt_comp is not None:
-                if np.isnan(st_comp[si, di]) or st_comp[si, di] < current_threshold:
+                if np.isnan(st_comp[si, di]) or st_comp[si, di] < mtf_sub_threshold:
                     continue
-                if np.isnan(mt_comp[si, di]) or mt_comp[si, di] < current_threshold:
+                if np.isnan(mt_comp[si, di]) or mt_comp[si, di] < mtf_sub_threshold:
                     continue
 
             if n_confirm[si, di] < min_confidence:
@@ -815,11 +784,10 @@ def analyze(trades: list, equity: float, max_dd: float,
     sh = np.mean(rets) / np.std(rets) * np.sqrt(252) if np.std(rets) > 0 else 0
 
     n_pyr = sum(1 for t in trades if t.get('pyr'))
-    n_base = len(trades) - n_pyr
     n_stop = sum(1 for t in trades if t['reason'] == 'stop')
     n_hold = sum(1 for t in trades if t['reason'] == 'hold')
 
-    print(f"  {label}: {len(trades)}t (base:{n_base} pyr:{n_pyr} stop:{n_stop} hold:{n_hold}) "
+    print(f"  {label}: {len(trades)}t (pyr:{n_pyr} stop:{n_stop} hold:{n_hold}) "
           f"WR={wr:.1f}% ann={ann:+.1f}% DD={max_dd:.1f}% Sh={sh:.2f} eq={equity:,.0f}")
 
     yr = {}
@@ -898,8 +866,7 @@ def walk_forward(
             top_n=top_n, atr_stop=atr_stop, hold_days=hold_days,
             pyramid_ratio=pyramid_ratio, pyramid_day=pyramid_day,
             start_di=test_start, end_di=test_end_idx + 1,
-            trade_state=trade_state,
-        )
+            trade_state=trade_state)
 
         test_trades = [t for t in trades if dates[t['di']].year == test_year]
         all_trades.extend(test_trades)
@@ -933,55 +900,51 @@ def ablation_study(
     base_threshold, adapt_amount, max_ad, loss_reduce, loss_pause,
     top_n, pyramid_ratio, atr_stop, start_di, label_prefix="",
 ):
-    """Remove each layer one at a time to show contribution."""
     print(f"\n{'=' * 70}")
     print(f"  ABLATION STUDY {label_prefix}")
     print(f"{'=' * 70}")
 
-    base_params = {
-        'base_threshold': base_threshold,
-        'adapt_amount': adapt_amount,
-        'max_ad': max_ad,
-        'loss_reduce': loss_reduce,
-        'loss_pause': loss_pause,
-        'top_n': top_n,
-        'pyramid_ratio': pyramid_ratio,
-        'atr_stop': atr_stop,
-        'hold_days': 5,
-        'pyramid_day': 1,
-        'start_di': start_di,
-    }
+    base_params = dict(
+        base_threshold=base_threshold, adapt_amount=adapt_amount,
+        max_ad=max_ad, loss_reduce=loss_reduce, loss_pause=loss_pause,
+        top_n=top_n, pyramid_ratio=pyramid_ratio, atr_stop=atr_stop,
+        hold_days=5, pyramid_day=1, start_di=start_di,
+    )
 
-    ablation_configs = [
-        ("ALL LAYERS", True, True, True, True, True),
-        ("NO MTF",     True, True, True, False, True),
-        ("NO ADAPT",   True, False, True, True, True),
-        ("NO BREADTH", True, True, False, True, True),
-        ("NO TAIL",    True, True, True, True, False),
-        ("NO MTF+NO BREADTH", True, False, False, True, True),
+    configs = [
+        ("ALL LAYERS (MTF+ADAPT+BRD+TAIL)", sigs_mtf, True, True, True, True),
+        ("  -MTF  (ADAPT+BRD+TAIL)",        sigs_mtf, True, True, True, False),
+        ("  -ADAPT (MTF+BRD+TAIL)",          sigs_mtf, True, False, True, True),
+        ("  -BREADTH (MTF+ADAPT+TAIL)",      sigs_mtf, True, True, False, True),
+        ("  -TAIL (MTF+ADAPT+BRD)",          sigs_mtf, True, True, True, False),
+        ("  -MTF-BREADTH (ADAPT+TAIL)",      sigs_mtf, True, False, False, True),
+        ("  BASELINE (no layers)",           sigs_single, False, False, False, False),
     ]
 
     results = []
-    for name, use_mtf, use_adapt, use_breadth, use_tail, use_this_mtf in ablation_configs:
-        sigs = sigs_mtf if use_this_mtf else sigs_single
+    for name, sigs, has_mtf, has_adapt, has_breadth, has_tail in configs:
+        # For the -TAIL config with MTF, use_mtf=True, use_tail_risk=False
+        use_mtf_flag = has_mtf if name != "  -TAIL (MTF+ADAPT+BRD)" else True
+        use_tail_flag = has_tail if name != "  -MTF  (ADAPT+BRD+TAIL)" else True
+
+        actual_use_mtf = name != "  -MTF  (ADAPT+BRD+TAIL)" and name != "  BASELINE (no layers)"
+        actual_use_tail = name != "  -TAIL (MTF+ADAPT+BRD)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
+        actual_use_adapt = name != "  -ADAPT (MTF+BRD+TAIL)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
+        actual_use_breadth = name != "  -BREADTH (MTF+ADAPT+TAIL)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
 
         trades, eq, dd, _ = backtest_v45(
             C, O, H, L, NS, ND, dates, syms, sigs,
-            use_mtf=use_this_mtf,
-            use_adaptive=use_adapt,
-            use_breadth=use_breadth,
-            use_tail_risk=use_tail,
+            use_mtf=actual_use_mtf,
+            use_adaptive=actual_use_adapt,
+            use_breadth=actual_use_breadth,
+            use_tail_risk=actual_use_tail,
             **base_params,
         )
         m = compute_metrics(trades, eq, dd)
         m['name'] = name
-        m['trades'] = trades
-        m['eq'] = eq
-        m['dd'] = dd
         results.append(m)
-        print(f"  {name:<25} {m['n']:>4}t WR={m['wr']:>5.1f}% "
-              f"ann={m['ann']:>+7.1f}% DD={m['dd']:>5.1f}% Sh={m['sh']:>5.2f} "
-              f"eq={m['eq']:>12,.0f}")
+        print(f"  {name:<40} {m['n']:>4}t WR={m['wr']:>5.1f}% "
+              f"ann={m['ann']:>+7.1f}% DD={m['dd']:>5.1f}% Sh={m['sh']:>5.2f}")
 
     return results
 
@@ -1008,21 +971,22 @@ def main():
             break
 
     # ============================================================
-    # 1. SIGNAL COMPUTATION
+    # 1. PRE-COMPUTE ALL SIGNALS (both st_weight variants + single-TF)
     # ============================================================
     print("\n" + "=" * 70)
-    print("  SECTION 1: SIGNAL COMPUTATION")
+    print("  SECTION 1: PRE-COMPUTING SIGNALS")
     print("=" * 70)
 
-    # Compute signals with multi-TF
-    sigs_mtf = compute_all_signals(
-        C, O, H, L, V, OI, NS, ND,
-        use_mtf=True, st_weight=0.60, use_breadth=True, max_ad=0.45)
+    print("\n--- MTF st_weight=0.55 ---")
+    sigs_055 = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=True, st_weight=0.55)
 
-    # Compute signals without multi-TF (for ablation)
-    sigs_single = compute_all_signals(
-        C, O, H, L, V, OI, NS, ND,
-        use_mtf=False, st_weight=0.60, use_breadth=True, max_ad=0.45)
+    print("\n--- MTF st_weight=0.60 ---")
+    sigs_060 = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=True, st_weight=0.60)
+
+    print("\n--- Single-TF (V18-style, for ablation) ---")
+    sigs_single = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=False)
+
+    sigs_map = {0.55: sigs_055, 0.60: sigs_060}
 
     # ============================================================
     # 2. DEFAULT CONFIG WALK-FORWARD
@@ -1031,15 +995,24 @@ def main():
     print("  SECTION 2: WALK-FORWARD VALIDATION (2019-2026) -- DEFAULT")
     print("=" * 70)
 
-    for bt, aa, mad in [(0.80, 0.05, 0.45), (0.85, 0.05, 0.45), (0.80, 0.07, 0.40)]:
+    default_configs = [
+        (0.80, 0.05, 0.45, 3, 5, 1, 0.5),
+        (0.80, 0.07, 0.45, 3, 5, 1, 0.5),
+        (0.75, 0.05, 0.45, 3, 5, 1, 0.5),
+        (0.80, 0.05, 0.45, 3, 5, 1, 0.0),
+        (0.85, 0.05, 0.45, 3, 5, 1, 0.5),
+        (0.80, 0.05, 0.45, 4, 6, 2, 0.5),
+    ]
+
+    for bt, aa, mad, lr, lp, tn, pyr in default_configs:
         walk_forward(
-            C, O, H, L, NS, ND, dates, syms, sigs_mtf,
+            C, O, H, L, NS, ND, dates, syms, sigs_060,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=bt, adapt_amount=aa,
-            max_ad=mad, loss_reduce=3, loss_pause=5,
-            top_n=1, atr_stop=3.0, hold_days=5,
-            pyramid_ratio=0.5, pyramid_day=1,
-            label=f"V45 bt={bt} aa={aa} mad={mad}")
+            max_ad=mad, loss_reduce=lr, loss_pause=lp,
+            top_n=tn, atr_stop=3.0, hold_days=5,
+            pyramid_ratio=pyr, pyramid_day=1,
+            label=f"bt={bt} aa={aa} mad={mad} lr={lr} lp={lp} tn={tn} pyr={pyr}")
 
     # ============================================================
     # 3. PARAMETER SWEEP (2019-2026)
@@ -1050,51 +1023,26 @@ def main():
 
     sweep_results = []
 
-    sweep_params = [
-        ('base_threshold', [0.80, 0.85]),
-        ('adapt_amount', [0.05, 0.07]),
-        ('st_weight', [0.55, 0.60]),
-        ('max_ad', [0.40, 0.45]),
-        ('loss_reduce', [3, 4]),
-        ('loss_pause', [5, 6]),
-        ('top_n', [1, 2]),
-        ('pyramid', [0.0, 0.5]),
-    ]
-
-    total_combos = 1
-    for _, vals in sweep_params:
-        total_combos *= len(vals)
-    print(f"  Total combinations: {total_combos}")
-
-    combo_count = 0
     for bt, aa, stw, mad, lr, lp, tn, pyr in product(
-        sweep_params[0][1],  # base_threshold
-        sweep_params[1][1],  # adapt_amount
-        sweep_params[2][1],  # st_weight
-        sweep_params[3][1],  # max_ad
-        sweep_params[4][1],  # loss_reduce
-        sweep_params[5][1],  # loss_pause
-        sweep_params[6][1],  # top_n
-        sweep_params[7][1],  # pyramid
+        [0.80, 0.85],        # base_threshold
+        [0.05, 0.07],        # adapt_amount
+        [0.55, 0.60],        # st_weight
+        [0.40, 0.45],        # max_ad
+        [3, 4],              # loss_reduce
+        [5, 6],              # loss_pause
+        [1, 2],              # top_n
+        [0.0, 0.5],          # pyramid
     ):
         if lp <= lr:
             continue
-        combo_count += 1
 
-        # Select pre-computed signals based on st_weight
-        if stw == 0.60:
-            use_sigs = sigs_mtf
-        else:
-            use_sigs = compute_all_signals(
-                C, O, H, L, V, OI, NS, ND,
-                use_mtf=True, st_weight=stw, use_breadth=True, max_ad=mad)
+        use_sigs = sigs_map[stw]
 
         trades, eq, dd, _ = backtest_v45(
             C, O, H, L, NS, ND, dates, syms, use_sigs,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=bt, adapt_amount=aa,
-            win_rate_window=20,
-            min_cap=0.70, max_cap=0.95,
+            win_rate_window=20, min_cap=0.70, max_cap=0.95,
             max_ad=mad, loss_reduce=lr, loss_pause=lp,
             top_n=tn, atr_stop=3.0, hold_days=5,
             pyramid_ratio=pyr, pyramid_day=1,
@@ -1111,7 +1059,7 @@ def main():
         })
 
     sweep_results.sort(key=lambda x: (-x['sh'], x['dd']))
-    print(f"\n  Evaluated {combo_count} combos, {len(sweep_results)} with 10+ trades")
+    print(f"\n  Evaluated {len(sweep_results)} configs with 10+ trades")
     print(f"\n{'BT':>4} {'AA':>4} {'STw':>4} {'MAD':>4} {'LR':>3} {'LP':>3} "
           f"{'TN':>3} {'Pyr':>4} "
           f"{'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} {'Sh':>6}")
@@ -1139,19 +1087,13 @@ def main():
         if len(best_full_results) >= 5:
             break
 
-        if r['stw'] != 0.60:
-            use_sigs = compute_all_signals(
-                C, O, H, L, V, OI, NS, ND,
-                use_mtf=True, st_weight=r['stw'], use_breadth=True, max_ad=r['mad'])
-        else:
-            use_sigs = sigs_mtf
+        use_sigs = sigs_map[r['stw']]
 
         trades, eq, dd, _ = backtest_v45(
             C, O, H, L, NS, ND, dates, syms, use_sigs,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=r['bt'], adapt_amount=r['aa'],
-            win_rate_window=20,
-            min_cap=0.70, max_cap=0.95,
+            win_rate_window=20, min_cap=0.70, max_cap=0.95,
             max_ad=r['mad'], loss_reduce=r['lr'], loss_pause=r['lp'],
             top_n=r['tn'], atr_stop=3.0, hold_days=5,
             pyramid_ratio=r['pyr'], pyramid_day=1,
@@ -1169,6 +1111,8 @@ def main():
     # ============================================================
     if sweep_results:
         best = sweep_results[0]
+        best_sigs = sigs_map[best['stw']]
+
         print("\n" + "=" * 70)
         print(f"  SECTION 5: BEST CONFIG WALK-FORWARD")
         print(f"  bt={best['bt']:.2f} aa={best['aa']:.2f} stw={best['stw']:.2f} "
@@ -1176,19 +1120,11 @@ def main():
               f"tn={best['tn']} pyr={best['pyr']:.1f}")
         print("=" * 70)
 
-        if best['stw'] != 0.60:
-            best_sigs = compute_all_signals(
-                C, O, H, L, V, OI, NS, ND,
-                use_mtf=True, st_weight=best['stw'], use_breadth=True, max_ad=best['mad'])
-        else:
-            best_sigs = sigs_mtf
-
         walk_forward(
             C, O, H, L, NS, ND, dates, syms, best_sigs,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=best['bt'], adapt_amount=best['aa'],
-            win_rate_window=20,
-            min_cap=0.70, max_cap=0.95,
+            win_rate_window=20, min_cap=0.70, max_cap=0.95,
             max_ad=best['mad'], loss_reduce=best['lr'], loss_pause=best['lp'],
             top_n=best['tn'], atr_stop=3.0, hold_days=5,
             pyramid_ratio=best['pyr'], pyramid_day=1,
@@ -1198,7 +1134,8 @@ def main():
         # 6. ABLATION STUDY
         # ============================================================
         ablation_study(
-            C, O, H, L, NS, ND, dates, syms, sigs_mtf, sigs_single,
+            C, O, H, L, NS, ND, dates, syms,
+            best_sigs, sigs_single,
             base_threshold=best['bt'],
             adapt_amount=best['aa'],
             max_ad=best['mad'],
@@ -1229,17 +1166,15 @@ def main():
     target_met = [r for r in best_full_results
                   if r['sh'] > 4.0 and r['dd'] < 15 and r['ann'] > 20]
     if target_met:
-        print(f"\n  TARGET MET: Sharpe > 4.0, MDD < 15%, Ann > 20%")
+        print(f"\n  *** TARGET MET: Sharpe > 4.0, MDD < 15%, Ann > 20% ***")
         for r in target_met:
             print(f"    {r.get('label', '')}: Sh={r['sh']:.2f} DD={r['dd']:.1f}% Ann={r['ann']:+.1f}%")
     else:
-        high_sharpe = [r for r in best_full_results if r['sh'] > 2.0]
-        if high_sharpe:
-            print(f"\n  Closest to target (Sharpe > 2.0):")
-            for r in high_sharpe[:3]:
+        near_target = sorted(best_full_results, key=lambda x: -x['sh'])[:3]
+        if near_target:
+            print(f"\n  Best configs (sorted by Sharpe):")
+            for r in near_target:
                 print(f"    {r.get('label', '')}: Sh={r['sh']:.2f} DD={r['dd']:.1f}% Ann={r['ann']:+.1f}%")
-        else:
-            print(f"\n  Target not fully met. See best configs above.")
 
     elapsed = time.time() - t0
     print(f"\n[V45] Done. {elapsed:.1f}s")
