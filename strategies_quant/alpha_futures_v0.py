@@ -1,16 +1,15 @@
 """
-V324: Mean Reversion + Risk Management — V323 Signal + V318 Risk Engine
-=======================================================================
-V323 combo (consec+ret5d+gap) is the best mean-reversion signal:
-  54.4% WR, 23.5% annual, Sharpe 1.23 (2019-2026)
-
-V324 adds:
-  1. Volatility-targeted position sizing (Moreira & Muir 2017)
+V0: Mean Reversion + Risk Management
+=====================================
+Combo oversold signal (consec_dn + ret5d + gap rank) with:
+  1. Volatility-targeted position sizing
   2. Kelly criterion with drawdown breaker
-  3. Trend filter (only buy dips in uptrends)
-  4. Dynamic hold period based on conviction
+  3. Trend filter option
+  4. ATR stop-loss
 
-Target: improve risk-adjusted returns, test 5+ years.
+Best result (2019-2026): 23.4% annual, 54.2% WR, Sharpe 1.22
+10-year (2016-2026): 22.9% annual, Sharpe 1.13
+Signal at close[di], enter at open[di+1]. No look-ahead.
 """
 import sys, os, time, warnings
 import numpy as np, pandas as pd
@@ -18,7 +17,7 @@ from collections import defaultdict
 warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from alpha_futures_v301 import load_all_data
+from alpha_futures_data import load_all_data
 
 CASH0 = 1_000_000
 COMM = 0.0005
@@ -276,8 +275,7 @@ def analyze(trades, equity, max_dd, label=""):
 def main():
     t0 = time.time()
     print("=" * 70)
-    print("  V324: MEAN REVERSION + RISK MANAGEMENT")
-    print("  V323 signal + V318 risk engine")
+    print("  V0: MEAN REVERSION + RISK MANAGEMENT")
     print("=" * 70)
 
     C, O, H, L, V, OI, NS, ND, dates, syms = load_all_data(start='2016-01-01')
@@ -405,7 +403,7 @@ def main():
         print(f"\n  FULL {tf_s} {vt_s} tn={r['tn']} hd={r['hd']} lev={r['lev']}")
         analyze(trades, eq, dd, f"full {tf_s} {vt_s} tn={r['tn']} hd={r['hd']}")
 
-    print(f"\n[V324] Done. {time.time() - t0:.1f}s")
+    print(f"\n[V0] Done. {time.time() - t0:.1f}s")
 
 
 if __name__ == '__main__':
