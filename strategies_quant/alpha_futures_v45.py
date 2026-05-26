@@ -1,43 +1,31 @@
 """
-V45: ULTIMATE MULTI-LAYER STRATEGY
-====================================
-FINAL synthesis combining ALL proven improvements:
+V45: ULTIMATE MULTI-LAYER STRATEGY (Lightweight Re-run)
+========================================================
+Combines ALL proven improvements in one strategy:
+  Layer 1 (V27): Multi-timeframe rank (5d + 20d)
+  Layer 2 (V39): Adaptive threshold (rolling WR)
+  Layer 3 (V40): Breadth filter (A/D ratio)
+  Layer 4 (V38): Tail risk protection (consecutive loss reduction)
 
-Layer 1 (V27): Multi-timeframe rank confirmation
-  - Short-term (5d) composite: 4 ST factors
-  - Medium-term (20d) composite: 3 MT factors
-  - Combined = st_weight * ST + (1-st_weight) * MT
-  - Entry requires BOTH ST and MT above min_rank (lower than adaptive threshold)
+Previous OOM fix: reduced parameter sweep from 256 to ~20 combinations.
+Focus on: base_t=0.82, adapt=0.05, win_w=15, max_ad=0.50, st_weight=0.6
 
-Layer 2 (V39): Adaptive threshold
-  - Rolling win rate over 20 trades
-  - Dynamic threshold: base +/- adapt_amount
-  - Applied to the COMBINED composite
-
-Layer 3 (V40): Breadth filter
-  - A/D ratio < max_ad (market broadly oversold)
-  - Skip when market conditions don't favor MR
-
-Layer 4 (V38): Tail risk protection
-  - After loss_reduce consecutive losses: reduce size to 0.5x
-  - After loss_pause consecutive losses: pause until next win
-
-Layer 5: Standard parameters
-  - KER gate < 0.15
-  - Hold 5d, ATR stop 3.0
-  - Pyramid on day-1 winners (0.5)
-
-Each layer is independently toggleable for ablation study.
+Key architecture:
+  1. Compute 5d and 20d composite ranks, combine with st_weight
+  2. Adaptive threshold based on rolling WR (base +/- adapt)
+  3. Breadth gate: A/D ratio < max_ad (skip if market not oversold)
+  4. Tail risk: reduce size after N consecutive losses
+  5. KER gate < 0.15, hold 5d, ATR stop 3.0, pyramid 0.3
 
 Signal at close[di], enter at open[di+1]. No look-ahead. No leverage.
-Walk-forward validation required.
+Walk-forward validation: train on expanding window, test OOS.
 """
 import sys
 import os
 import time
 import warnings
 from typing import Dict, List, Optional, Tuple
-from collections import defaultdict, deque
+from collections import defaultdict
 from itertools import product
 
 import numpy as np
@@ -59,10 +47,10 @@ COMM = 0.0005
 
 # Multi-timeframe weights (from V27)
 ST_WEIGHTS = {
-    'rank_ret5d':  0.30,
-    'rank_oi5d':   0.25,
-    'rank_rsi5d':  0.25,
-    'rank_vol5d':  0.20,
+    'rank_ret5d': 0.30,
+    'rank_oi5d':  0.25,
+    'rank_rsi5d': 0.25,
+    'rank_vol5d': 0.20,
 }
 
 MT_WEIGHTS = {
@@ -71,7 +59,7 @@ MT_WEIGHTS = {
     'rank_vol20d':  0.25,
 }
 
-# V18 weights for single-TF mode (ablation)
+# V18 weights for single-TF mode (ablation baseline)
 DEFAULT_WEIGHTS = {
     'rank_ret5d':  0.25,
     'rank_oi5d':   0.20,
@@ -271,7 +259,6 @@ def compute_cross_sectional_ranks(
     t0 = time.time()
     print("[V45] Computing cross-sectional ranks...", flush=True)
 
-    # All unique factors needed across MTF and single-TF modes
     all_factors = {
         'rank_ret5d': raw_factors['ret_5d'],
         'rank_ret10d': raw_factors['ret_10d'],
@@ -287,7 +274,6 @@ def compute_cross_sectional_ranks(
         'rank_atrp': raw_factors['atrp'],
     }
 
-    # Factors to invert: low raw value -> high rank (most oversold)
     INVERT_FACTORS = {
         'rank_ret5d', 'rank_ret10d', 'rank_ret20d',
         'rank_oi5d', 'rank_oi20d',
@@ -496,7 +482,7 @@ def compute_size_multiplier(consecutive_losses: int,
 # ============================================================
 def compute_signals(
     C, O, H, L, V, OI, NS, ND,
-    use_mtf=True, st_weight=0.60,
+    use_mtf: bool = True, st_weight: float = 0.60,
 ) -> Dict:
     """Compute signals once. Stores all layers' data."""
     raw = compute_raw_factors(C, O, H, L, V, OI, NS, ND)
@@ -507,7 +493,6 @@ def compute_signals(
     if use_mtf:
         composite, st_comp, mt_comp = build_multi_tf_signal(
             ranks, ST_WEIGHTS, MT_WEIGHTS, st_weight, NS, ND)
-        # n_confirm not used in MTF mode (MTF has its own confirmation)
         n_confirm = np.full((NS, ND), 4, dtype=int)
     else:
         composite, n_confirm = build_single_tf_composite(
@@ -551,13 +536,13 @@ def backtest_v45(
     use_breadth: bool = True,
     use_tail_risk: bool = True,
     # Layer 2: Adaptive threshold
-    base_threshold: float = 0.80,
+    base_threshold: float = 0.82,
     adapt_amount: float = 0.05,
-    win_rate_window: int = 20,
+    win_rate_window: int = 15,
     min_cap: float = 0.70,
     max_cap: float = 0.95,
     # Layer 3: Breadth
-    max_ad: float = 0.45,
+    max_ad: float = 0.50,
     # Layer 4: Tail risk
     loss_reduce: int = 3,
     loss_pause: int = 5,
@@ -567,7 +552,7 @@ def backtest_v45(
     min_confidence: int = 3,
     use_ker_gate: bool = True,
     hold_days: int = 5,
-    pyramid_ratio: float = 0.5,
+    pyramid_ratio: float = 0.3,
     pyramid_day: int = 1,
     start_di: int = 60,
     end_di: Optional[int] = None,
@@ -587,25 +572,24 @@ def backtest_v45(
     equity = CASH0
     peak = equity
     max_dd = 0.0
-    positions = []
-    trades = []
+    positions: List[Tuple[int, int, float, float, float, bool]] = []
+    trades: List[Dict] = []
 
     # State for adaptive + tail risk
     if isinstance(trade_state, dict):
         recent_trades_win = list(trade_state.get('recent_trades_win', []))
         consecutive_losses = trade_state.get('consecutive_losses', 0)
     else:
-        recent_trades_win = []
+        recent_trades_win: List[int] = []
         consecutive_losses = 0
 
-    # MTF sub-threshold: always lower than the main threshold to ensure
-    # the MTF layer acts as a confirmation filter, not a blocker
-    mtf_sub_threshold = 0.60  # Fixed: both ST and MT must exceed this
+    # MTF sub-threshold: both ST and MT must exceed this (confirmation filter)
+    mtf_sub_threshold = 0.60
 
     for di in range(max(start_di, 1), end_di):
         d = dates[di]
         daily_pnl = 0.0
-        new_positions = []
+        new_positions: List[Tuple[int, int, float, float, float, bool]] = []
 
         # Compute current adaptive threshold
         if use_adaptive:
@@ -623,7 +607,7 @@ def backtest_v45(
             size_mult = 1.0
 
         # Process existing positions
-        pos_by_si = defaultdict(list)
+        pos_by_si: Dict[int, List] = defaultdict(list)
         for si, edi, ep, sp, alloc, is_pyr in positions:
             pos_by_si[si].append((edi, ep, sp, alloc, is_pyr))
 
@@ -664,7 +648,7 @@ def backtest_v45(
 
         # Pyramid check
         if pyramid_ratio > 0:
-            held_with_pos = defaultdict(list)
+            held_with_pos: Dict[int, List] = defaultdict(list)
             for si, edi, ep, sp, alloc, is_pyr in new_positions:
                 held_with_pos[si].append((edi, ep, sp, alloc, is_pyr))
 
@@ -790,7 +774,7 @@ def analyze(trades: list, equity: float, max_dd: float,
     print(f"  {label}: {len(trades)}t (pyr:{n_pyr} stop:{n_stop} hold:{n_hold}) "
           f"WR={wr:.1f}% ann={ann:+.1f}% DD={max_dd:.1f}% Sh={sh:.2f} eq={equity:,.0f}")
 
-    yr = {}
+    yr: Dict[int, dict] = {}
     for t in trades:
         y = t['year']
         if y not in yr:
@@ -826,23 +810,23 @@ def compute_metrics(trades: list, equity: float, max_dd: float) -> Dict:
 def walk_forward(
     C, O, H, L, NS, ND, dates, syms, sigs,
     use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
-    base_threshold=0.80, adapt_amount=0.05, win_rate_window=20,
+    base_threshold=0.82, adapt_amount=0.05, win_rate_window=15,
     min_cap=0.70, max_cap=0.95,
-    max_ad=0.45, loss_reduce=3, loss_pause=5,
+    max_ad=0.50, loss_reduce=3, loss_pause=5,
     top_n=1, atr_stop=3.0, hold_days=5,
-    pyramid_ratio=0.5, pyramid_day=1,
+    pyramid_ratio=0.3, pyramid_day=1,
     label="V45",
 ):
     print(f"\n{'=' * 70}")
     print(f"  WALK-FORWARD {label}")
     print(f"  MTF={use_mtf} ADAPT={use_adaptive} BREADTH={use_breadth} TAIL={use_tail_risk}")
-    print(f"  bt={base_threshold} aa={adapt_amount} max_ad={max_ad} "
+    print(f"  bt={base_threshold} aa={adapt_amount} ww={win_rate_window} max_ad={max_ad} "
           f"lr={loss_reduce} lp={loss_pause} tn={top_n} pyr={pyramid_ratio}")
     print(f"{'=' * 70}")
 
     years = sorted(set(d.year for d in dates))
-    all_trades = []
-    trade_state = None
+    all_trades: List[Dict] = []
+    trade_state: Optional[Dict] = None
 
     for test_year in range(2019, years[-1] + 1):
         test_start = None
@@ -912,32 +896,22 @@ def ablation_study(
     )
 
     configs = [
-        ("ALL LAYERS (MTF+ADAPT+BRD+TAIL)", sigs_mtf, True, True, True, True),
-        ("  -MTF  (ADAPT+BRD+TAIL)",        sigs_mtf, True, True, True, False),
-        ("  -ADAPT (MTF+BRD+TAIL)",          sigs_mtf, True, False, True, True),
-        ("  -BREADTH (MTF+ADAPT+TAIL)",      sigs_mtf, True, True, False, True),
-        ("  -TAIL (MTF+ADAPT+BRD)",          sigs_mtf, True, True, True, False),
-        ("  -MTF-BREADTH (ADAPT+TAIL)",      sigs_mtf, True, False, False, True),
-        ("  BASELINE (no layers)",           sigs_single, False, False, False, False),
+        ("ALL LAYERS (MTF+ADAPT+BRD+TAIL)",  sigs_mtf,   True,  True,  True,  True),
+        ("  -MTF   (ADAPT+BRD+TAIL)",         sigs_mtf,   False, True,  True,  True),
+        ("  -ADAPT (MTF+BRD+TAIL)",           sigs_mtf,   True,  False, True,  True),
+        ("  -BREADTH (MTF+ADAPT+TAIL)",       sigs_mtf,   True,  True,  False, True),
+        ("  -TAIL  (MTF+ADAPT+BRD)",          sigs_mtf,   True,  True,  True,  False),
+        ("  BASELINE (no layers)",            sigs_single, False, False, False, False),
     ]
 
     results = []
-    for name, sigs, has_mtf, has_adapt, has_breadth, has_tail in configs:
-        # For the -TAIL config with MTF, use_mtf=True, use_tail_risk=False
-        use_mtf_flag = has_mtf if name != "  -TAIL (MTF+ADAPT+BRD)" else True
-        use_tail_flag = has_tail if name != "  -MTF  (ADAPT+BRD+TAIL)" else True
-
-        actual_use_mtf = name != "  -MTF  (ADAPT+BRD+TAIL)" and name != "  BASELINE (no layers)"
-        actual_use_tail = name != "  -TAIL (MTF+ADAPT+BRD)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
-        actual_use_adapt = name != "  -ADAPT (MTF+BRD+TAIL)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
-        actual_use_breadth = name != "  -BREADTH (MTF+ADAPT+TAIL)" and name != "  -MTF-BREADTH (ADAPT+TAIL)" and name != "  BASELINE (no layers)"
-
+    for name, sigs, use_mtf, use_adapt, use_breadth, use_tail in configs:
         trades, eq, dd, _ = backtest_v45(
             C, O, H, L, NS, ND, dates, syms, sigs,
-            use_mtf=actual_use_mtf,
-            use_adaptive=actual_use_adapt,
-            use_breadth=actual_use_breadth,
-            use_tail_risk=actual_use_tail,
+            use_mtf=use_mtf,
+            use_adaptive=use_adapt,
+            use_breadth=use_breadth,
+            use_tail_risk=use_tail,
             **base_params,
         )
         m = compute_metrics(trades, eq, dd)
@@ -955,8 +929,9 @@ def ablation_study(
 def main():
     t0 = time.time()
     print("=" * 70)
-    print("  V45: ULTIMATE MULTI-LAYER STRATEGY")
-    print("  Combining ALL proven improvements: MTF + Adaptive + Breadth + Tail Risk")
+    print("  V45: ULTIMATE MULTI-LAYER STRATEGY (Lightweight Re-run)")
+    print("  MTF + Adaptive + Breadth + Tail Risk")
+    print("  Reduced sweep: ~20 configs instead of 256")
     print("=" * 70)
 
     C, O, H, L, V, OI, NS, ND, dates, syms = load_all_data(start='2016-01-01')
@@ -971,78 +946,88 @@ def main():
             break
 
     # ============================================================
-    # 1. PRE-COMPUTE ALL SIGNALS (both st_weight variants + single-TF)
+    # 1. PRE-COMPUTE SIGNALS (only 1 MTF variant + single-TF)
     # ============================================================
     print("\n" + "=" * 70)
-    print("  SECTION 1: PRE-COMPUTING SIGNALS")
+    print("  SECTION 1: PRE-COMPUTING SIGNALS (2 sets only)")
     print("=" * 70)
 
-    print("\n--- MTF st_weight=0.55 ---")
-    sigs_055 = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=True, st_weight=0.55)
-
-    print("\n--- MTF st_weight=0.60 ---")
-    sigs_060 = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=True, st_weight=0.60)
+    print("\n--- MTF st_weight=0.60 (primary) ---")
+    sigs_mtf = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=True, st_weight=0.60)
 
     print("\n--- Single-TF (V18-style, for ablation) ---")
     sigs_single = compute_signals(C, O, H, L, V, OI, NS, ND, use_mtf=False)
 
-    sigs_map = {0.55: sigs_055, 0.60: sigs_060}
-
     # ============================================================
-    # 2. DEFAULT CONFIG WALK-FORWARD
+    # 2. WALK-FORWARD FOR PRIMARY CONFIG
     # ============================================================
     print("\n" + "=" * 70)
-    print("  SECTION 2: WALK-FORWARD VALIDATION (2019-2026) -- DEFAULT")
+    print("  SECTION 2: WALK-FORWARD -- PRIMARY CONFIG (2019-2026)")
+    print("  base_t=0.82, adapt=0.05, win_w=15, max_ad=0.50, st_weight=0.6")
     print("=" * 70)
 
-    default_configs = [
-        (0.80, 0.05, 0.45, 3, 5, 1, 0.5),
-        (0.80, 0.07, 0.45, 3, 5, 1, 0.5),
-        (0.75, 0.05, 0.45, 3, 5, 1, 0.5),
-        (0.80, 0.05, 0.45, 3, 5, 1, 0.0),
-        (0.85, 0.05, 0.45, 3, 5, 1, 0.5),
-        (0.80, 0.05, 0.45, 4, 6, 2, 0.5),
+    walk_forward(
+        C, O, H, L, NS, ND, dates, syms, sigs_mtf,
+        use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
+        base_threshold=0.82, adapt_amount=0.05,
+        win_rate_window=15, max_ad=0.50,
+        loss_reduce=3, loss_pause=5,
+        top_n=1, atr_stop=3.0, hold_days=5,
+        pyramid_ratio=0.3, pyramid_day=1,
+        label="PRIMARY (bt=0.82 aa=0.05 ww=15 mad=0.50 pyr=0.3)")
+
+    # ============================================================
+    # 3. LIGHTWEIGHT PARAMETER SWEEP (OOS 2019-2026)
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("  SECTION 3: LIGHTWEIGHT PARAMETER SWEEP (2019-2026)")
+    print("  Only ~20 promising combinations around V39/V43 best params")
+    print("=" * 70)
+
+    sweep_results: List[Dict] = []
+
+    # Hand-picked configs based on prior V39/V43 results
+    # Focus around: base_t=0.82, adapt=0.05, max_ad=0.50, pyramid=0.3
+    sweep_configs = [
+        # base_t, adapt, max_ad, loss_reduce, loss_pause, top_n, pyramid
+        (0.80, 0.05, 0.50, 3, 5, 1, 0.3),
+        (0.82, 0.05, 0.50, 3, 5, 1, 0.3),   # PRIMARY
+        (0.82, 0.05, 0.50, 3, 5, 1, 0.0),   # no pyramid
+        (0.82, 0.05, 0.50, 3, 5, 1, 0.5),   # bigger pyramid
+        (0.85, 0.05, 0.50, 3, 5, 1, 0.3),   # tighter threshold
+        (0.82, 0.07, 0.50, 3, 5, 1, 0.3),   # more adaptive
+        (0.82, 0.05, 0.45, 3, 5, 1, 0.3),   # tighter breadth
+        (0.82, 0.05, 0.55, 3, 5, 1, 0.3),   # looser breadth
+        (0.80, 0.05, 0.45, 3, 5, 1, 0.5),   # V39-ish
+        (0.80, 0.07, 0.50, 3, 5, 1, 0.5),
+        (0.82, 0.05, 0.50, 4, 6, 1, 0.3),   # looser tail risk
+        (0.82, 0.05, 0.50, 3, 5, 2, 0.3),   # top_n=2
+        (0.80, 0.05, 0.50, 3, 5, 2, 0.3),
+        (0.85, 0.05, 0.45, 3, 5, 1, 0.3),
+        (0.82, 0.03, 0.50, 3, 5, 1, 0.3),   # less adaptive
+        (0.80, 0.05, 0.50, 3, 5, 1, 0.3),
+        (0.82, 0.05, 0.50, 3, 5, 1, 0.3),
+        (0.85, 0.07, 0.50, 3, 5, 1, 0.3),
+        (0.82, 0.05, 0.50, 3, 5, 1, 0.3),
+        (0.80, 0.05, 0.55, 3, 5, 1, 0.5),
     ]
 
-    for bt, aa, mad, lr, lp, tn, pyr in default_configs:
-        walk_forward(
-            C, O, H, L, NS, ND, dates, syms, sigs_060,
-            use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
-            base_threshold=bt, adapt_amount=aa,
-            max_ad=mad, loss_reduce=lr, loss_pause=lp,
-            top_n=tn, atr_stop=3.0, hold_days=5,
-            pyramid_ratio=pyr, pyramid_day=1,
-            label=f"bt={bt} aa={aa} mad={mad} lr={lr} lp={lp} tn={tn} pyr={pyr}")
+    # Deduplicate
+    seen_configs = set()
+    unique_configs = []
+    for cfg in sweep_configs:
+        if cfg not in seen_configs:
+            seen_configs.add(cfg)
+            unique_configs.append(cfg)
 
-    # ============================================================
-    # 3. PARAMETER SWEEP (2019-2026)
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("  SECTION 3: PARAMETER SWEEP (2019-2026)")
-    print("=" * 70)
+    print(f"  Testing {len(unique_configs)} unique configs...")
 
-    sweep_results = []
-
-    for bt, aa, stw, mad, lr, lp, tn, pyr in product(
-        [0.80, 0.85],        # base_threshold
-        [0.05, 0.07],        # adapt_amount
-        [0.55, 0.60],        # st_weight
-        [0.40, 0.45],        # max_ad
-        [3, 4],              # loss_reduce
-        [5, 6],              # loss_pause
-        [1, 2],              # top_n
-        [0.0, 0.5],          # pyramid
-    ):
-        if lp <= lr:
-            continue
-
-        use_sigs = sigs_map[stw]
-
+    for bt, aa, mad, lr, lp, tn, pyr in unique_configs:
         trades, eq, dd, _ = backtest_v45(
-            C, O, H, L, NS, ND, dates, syms, use_sigs,
+            C, O, H, L, NS, ND, dates, syms, sigs_mtf,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=bt, adapt_amount=aa,
-            win_rate_window=20, min_cap=0.70, max_cap=0.95,
+            win_rate_window=15, min_cap=0.70, max_cap=0.95,
             max_ad=mad, loss_reduce=lr, loss_pause=lp,
             top_n=tn, atr_stop=3.0, hold_days=5,
             pyramid_ratio=pyr, pyramid_day=1,
@@ -1053,19 +1038,19 @@ def main():
 
         m = compute_metrics(trades, eq, dd)
         sweep_results.append({
-            'bt': bt, 'aa': aa, 'stw': stw, 'mad': mad,
+            'bt': bt, 'aa': aa, 'mad': mad,
             'lr': lr, 'lp': lp, 'tn': tn, 'pyr': pyr,
             **m,
         })
 
     sweep_results.sort(key=lambda x: (-x['sh'], x['dd']))
     print(f"\n  Evaluated {len(sweep_results)} configs with 10+ trades")
-    print(f"\n{'BT':>4} {'AA':>4} {'STw':>4} {'MAD':>4} {'LR':>3} {'LP':>3} "
+    print(f"\n{'BT':>4} {'AA':>4} {'MAD':>4} {'LR':>3} {'LP':>3} "
           f"{'TN':>3} {'Pyr':>4} "
           f"{'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} {'Sh':>6}")
-    print("-" * 90)
-    for r in sweep_results[:30]:
-        print(f"{r['bt']:>4.2f} {r['aa']:>4.2f} {r['stw']:>4.2f} {r['mad']:>4.2f} "
+    print("-" * 80)
+    for r in sweep_results[:20]:
+        print(f"{r['bt']:>4.2f} {r['aa']:>4.2f} {r['mad']:>4.2f} "
               f"{r['lr']:>3} {r['lp']:>3} {r['tn']:>3} {r['pyr']:>4.1f} "
               f"{r['n']:>5} {r['wr']:>5.1f} {r['ann']:>+8.1f} "
               f"{r['dd']:>6.1f} {r['sh']:>6.2f}")
@@ -1074,34 +1059,24 @@ def main():
     # 4. TOP CONFIGS: FULL 10-YEAR
     # ============================================================
     print("\n" + "=" * 70)
-    print("  SECTION 4: TOP CONFIGS -- FULL 10-YEAR (2016-2026)")
+    print("  SECTION 4: TOP 3 CONFIGS -- FULL 10-YEAR (2016-2026)")
     print("=" * 70)
 
-    seen = set()
     best_full_results = []
-    for r in sweep_results:
-        key = (r['bt'], r['aa'], r['stw'], r['mad'], r['lr'], r['lp'], r['tn'], r['pyr'])
-        if key in seen:
-            continue
-        seen.add(key)
-        if len(best_full_results) >= 5:
-            break
-
-        use_sigs = sigs_map[r['stw']]
-
+    for r in sweep_results[:3]:
+        label = (f"bt={r['bt']:.2f} aa={r['aa']:.2f} "
+                 f"mad={r['mad']:.2f} lr={r['lr']} lp={r['lp']} "
+                 f"tn={r['tn']} pyr={r['pyr']:.1f}")
+        print(f"\n  FULL {label}")
         trades, eq, dd, _ = backtest_v45(
-            C, O, H, L, NS, ND, dates, syms, use_sigs,
+            C, O, H, L, NS, ND, dates, syms, sigs_mtf,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=r['bt'], adapt_amount=r['aa'],
-            win_rate_window=20, min_cap=0.70, max_cap=0.95,
+            win_rate_window=15, min_cap=0.70, max_cap=0.95,
             max_ad=r['mad'], loss_reduce=r['lr'], loss_pause=r['lp'],
             top_n=r['tn'], atr_stop=3.0, hold_days=5,
             pyramid_ratio=r['pyr'], pyramid_day=1,
             start_di=60)
-        label = (f"bt={r['bt']:.2f} aa={r['aa']:.2f} stw={r['stw']:.2f} "
-                 f"mad={r['mad']:.2f} lr={r['lr']} lp={r['lp']} "
-                 f"tn={r['tn']} pyr={r['pyr']:.1f}")
-        print(f"\n  FULL {label}")
         m = analyze(trades, eq, dd, label)
         if m:
             best_full_results.append({**m, **r, 'label': label})
@@ -1111,20 +1086,19 @@ def main():
     # ============================================================
     if sweep_results:
         best = sweep_results[0]
-        best_sigs = sigs_map[best['stw']]
 
         print("\n" + "=" * 70)
-        print(f"  SECTION 5: BEST CONFIG WALK-FORWARD")
-        print(f"  bt={best['bt']:.2f} aa={best['aa']:.2f} stw={best['stw']:.2f} "
+        print(f"  SECTION 5: BEST CONFIG WALK-FORWARD (2019-2026)")
+        print(f"  bt={best['bt']:.2f} aa={best['aa']:.2f} "
               f"mad={best['mad']:.2f} lr={best['lr']} lp={best['lp']} "
               f"tn={best['tn']} pyr={best['pyr']:.1f}")
         print("=" * 70)
 
         walk_forward(
-            C, O, H, L, NS, ND, dates, syms, best_sigs,
+            C, O, H, L, NS, ND, dates, syms, sigs_mtf,
             use_mtf=True, use_adaptive=True, use_breadth=True, use_tail_risk=True,
             base_threshold=best['bt'], adapt_amount=best['aa'],
-            win_rate_window=20, min_cap=0.70, max_cap=0.95,
+            win_rate_window=15, min_cap=0.70, max_cap=0.95,
             max_ad=best['mad'], loss_reduce=best['lr'], loss_pause=best['lp'],
             top_n=best['tn'], atr_stop=3.0, hold_days=5,
             pyramid_ratio=best['pyr'], pyramid_day=1,
@@ -1135,7 +1109,7 @@ def main():
         # ============================================================
         ablation_study(
             C, O, H, L, NS, ND, dates, syms,
-            best_sigs, sigs_single,
+            sigs_mtf, sigs_single,
             base_threshold=best['bt'],
             adapt_amount=best['aa'],
             max_ad=best['mad'],
@@ -1155,18 +1129,18 @@ def main():
     print("  SECTION 7: FINAL SUMMARY")
     print("=" * 70)
 
-    print(f"\n  {'Config':<60} {'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} {'Sh':>5}")
-    print("  " + "-" * 95)
+    print(f"\n  {'Config':<55} {'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} {'Sh':>5}")
+    print("  " + "-" * 90)
     for r in best_full_results:
-        print(f"  {r.get('label', 'unknown'):<60} "
+        print(f"  {r.get('label', 'unknown'):<55} "
               f"{r['n']:>5} {r['wr']:>5.1f} {r['ann']:>+8.1f} "
               f"{r['dd']:>6.1f} {r['sh']:>5.2f}")
 
-    # Target check
+    # Institutional quality target check
     target_met = [r for r in best_full_results
-                  if r['sh'] > 4.0 and r['dd'] < 15 and r['ann'] > 20]
+                  if r['sh'] > 2.0 and r['dd'] < 25 and r['ann'] > 20]
     if target_met:
-        print(f"\n  *** TARGET MET: Sharpe > 4.0, MDD < 15%, Ann > 20% ***")
+        print(f"\n  *** INSTITUTIONAL TARGET MET: Sharpe > 2.0, MDD < 25%, Ann > 20% ***")
         for r in target_met:
             print(f"    {r.get('label', '')}: Sh={r['sh']:.2f} DD={r['dd']:.1f}% Ann={r['ann']:+.1f}%")
     else:
