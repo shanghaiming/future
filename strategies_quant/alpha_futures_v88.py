@@ -953,16 +953,10 @@ def main() -> None:
 
     # Test different numbers of top factors (IC-first selection)
     composites = {}
-    for n_top in [5, 6, 8, 10]:
+    for n_top in [6, 8, 10]:
         selected = select_top_factors(mi_scores, ic_scores, n_top=n_top, method="ic_first")
         comp = build_weighted_composite(ranks, selected, NS, ND)
         composites[f"ic{n_top}"] = (comp, selected)
-
-    # Also test with combined method for comparison
-    for n_top in [8, 10]:
-        selected = select_top_factors(mi_scores, ic_scores, n_top=n_top, method="combined")
-        comp = build_weighted_composite(ranks, selected, NS, ND)
-        composites[f"combo{n_top}"] = (comp, selected)
 
     # Also build the V80 baseline composite (7 existing factors with V80 weights)
     v80_weights = {
@@ -987,10 +981,10 @@ def main() -> None:
 
     for comp_name, (composite, selected) in composites.items():
         for mps in [2, 3]:
-            for mp in [3, 5, 8, 12]:
-                for wt in [0.50, 0.55, 0.60, 0.65]:
-                    for nt in [0.65, 0.70, 0.75, 0.80, 0.85]:
-                        for lt in [0.80, 0.85, 0.90, 0.95]:
+            for mp in [3, 5, 8]:
+                for wt in [0.50, 0.55, 0.60]:
+                    for nt in [0.65, 0.70, 0.75, 0.80]:
+                        for lt in [0.85, 0.90, 0.95]:
                             if lt <= nt:
                                 continue
                             sweep_count += 1
@@ -1082,12 +1076,12 @@ def main() -> None:
         print(f"\n  FULL {label}")
         analyze(trades, eq, dd, label)
 
-    # === STEP 7: Walk-forward for best ===
+    # === STEP 7: Walk-forward for best + high-trade variant ===
     best = results[0]
     best_comp_name = best["comp"]
     best_composite, best_selected = composites[best_comp_name]
     print("\n" + "=" * 70)
-    print(f"  STEP 7: Walk-forward for BEST config")
+    print(f"  STEP 7A: Walk-forward for BEST Sharpe config")
     print(f"  Composite: {best_comp_name}")
     print(f"  Factors: {[f'{n}:{w:.3f}' for n, w in best_selected]}")
     print(f"  wt={best['wt']:.2f} nt={best['nt']:.2f} "
@@ -1102,6 +1096,40 @@ def main() -> None:
         win_rate_window=15,
         max_positions=best["mp"],
         max_per_sector=best["mps"],
+    )
+
+    # High-trade variant: ic10 with lower thresholds for more trades
+    # From sweep: ic10 wt=0.55 nt=0.75 lt=0.95 mps=3 mp=5 → 111t, ann+15.5%, Sh=5.44
+    print("\n" + "=" * 70)
+    print(f"  STEP 7B: Walk-forward for HIGH-TRADE variant")
+    print(f"  Composite: ic10, wt=0.55 nt=0.75 lt=0.95 mps=3 mp=5")
+    print("=" * 70)
+    ic10_comp, ic10_selected = composites["ic10"]
+    walk_forward(
+        C, O, H, L, NS, ND, dates, syms, ic10_comp,
+        sector_lookup=sector_lookup,
+        win_threshold=0.55,
+        normal_threshold=0.75,
+        lose_threshold=0.95,
+        win_rate_window=15,
+        max_positions=5,
+        max_per_sector=3,
+    )
+
+    # Ultra high-trade variant: ic10 with very low thresholds
+    print("\n" + "=" * 70)
+    print(f"  STEP 7C: Walk-forward for ULTRA HIGH-TRADE variant")
+    print(f"  Composite: ic10, wt=0.50 nt=0.65 lt=0.90 mps=3 mp=8")
+    print("=" * 70)
+    walk_forward(
+        C, O, H, L, NS, ND, dates, syms, ic10_comp,
+        sector_lookup=sector_lookup,
+        win_threshold=0.50,
+        normal_threshold=0.65,
+        lose_threshold=0.90,
+        win_rate_window=15,
+        max_positions=8,
+        max_per_sector=3,
     )
 
     # === STEP 8: V88 best vs V80 baseline comparison ===
