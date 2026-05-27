@@ -557,22 +557,28 @@ class BayesianCUSUMTracker:
         self.decay_interval = 20  # decay every 20 trades
 
     def update(self, pnl_pct: float) -> None:
-        """Update tracker with a new trade result."""
+        """Update tracker with a new trade result.
+
+        pnl_pct is in percentage form (e.g. +1.5 for 1.5%).
+        """
         self.trade_count += 1
         is_win = pnl_pct > 0
+        ret_raw = pnl_pct / 100.0  # convert to raw decimal
 
         # --- CUSUM update ---
-        # Positive CUSUM: accumulates when returns are BELOW target
-        # (detects edge deterioration)
+        # Deterioration CUSUM: accumulates when returns are BELOW target
+        # S_det = max(0, S + mu_target - ret - k)
+        # When ret < mu_target - k => accumulates => edge is deteriorating
         self.cusum_pos = max(
             0.0,
-            self.cusum_pos + (pnl_pct / 100.0 - self.mu_target - self.cusum_k)
+            self.cusum_pos + (self.mu_target - ret_raw - self.cusum_k)
         )
-        # Negative CUSUM: accumulates when returns are ABOVE target
-        # (detects edge improvement)
+        # Improvement CUSUM: accumulates when returns are ABOVE target
+        # S_imp = max(0, S + ret - mu_target - k)
+        # When ret > mu_target + k => accumulates => edge is improving
         self.cusum_neg = max(
             0.0,
-            self.cusum_neg + (-(pnl_pct / 100.0 - self.mu_target) - self.cusum_k)
+            self.cusum_neg + (ret_raw - self.mu_target - self.cusum_k)
         )
 
         # --- Bayesian update ---
@@ -599,7 +605,12 @@ class BayesianCUSUMTracker:
         self.beta = d * self.beta + (1 - d) * self.prior_beta
 
     def _update_regime(self) -> None:
-        """Determine regime from CUSUM signals."""
+        """Determine regime from CUSUM signals.
+
+        cusum_pos (deterioration) > h => CONSERVATIVE (edge fading)
+        cusum_neg (improvement) > h => AGGRESSIVE (edge strengthening)
+        Neither => NORMAL
+        """
         if self.cusum_pos > self.cusum_h:
             self.regime = "CONSERVATIVE"
         elif self.cusum_neg > self.cusum_h:
@@ -646,24 +657,26 @@ class BayesianCUSUMTracker:
 
     @property
     def entry_threshold(self) -> float:
-        """Adaptive entry threshold based on regime.
+        """Adaptive entry threshold based on regime + Bayesian WR.
 
         CONSERVATIVE: require stronger signals (higher threshold)
         AGGRESSIVE: accept weaker signals (lower threshold)
         NORMAL: moderate threshold
+        Higher Bayesian WR => lower threshold (more trades, edge is good)
+        Lower Bayesian WR => higher threshold (fewer, better trades)
         """
         base_threshold = 0.75
         bayes_wr = self.win_rate
 
-        # Adjust threshold based on Bayesian win rate
-        # Higher estimated WR => can afford lower threshold (more trades)
-        # Lower estimated WR => need higher threshold (fewer, better trades)
-        wr_adjustment = (0.5 - bayes_wr) * 0.6  # +/- 0.30 max
+        # Adjustment from Bayesian win rate estimate
+        # WR > 50% => lower threshold (more trades, edge confirmed)
+        # WR < 50% => higher threshold (fewer trades, protect capital)
+        wr_adjustment = (0.5 - bayes_wr) * 0.4  # +/- 0.20 max
 
         if self.regime == "CONSERVATIVE":
-            return min(base_threshold + wr_adjustment + 0.10, 0.95)
+            return np.clip(base_threshold + wr_adjustment + 0.08, 0.65, 0.95)
         elif self.regime == "AGGRESSIVE":
-            return max(base_threshold + wr_adjustment - 0.10, 0.55)
+            return np.clip(base_threshold + wr_adjustment - 0.08, 0.55, 0.90)
         else:
             return np.clip(base_threshold + wr_adjustment, 0.60, 0.90)
 
@@ -808,10 +821,14 @@ def backtest_v87(
         if len(positions) >= max_positions:
             continue
 
-        # In CONSERVATIVE regime, reduce max positions by 1
+        # In CONSERVATIVE regime or Kelly near zero, reduce max positions
         effective_max = max_positions
         if current_regime == "CONSERVATIVE":
             effective_max = max(1, max_positions - 1)
+        # If Kelly says no edge, further reduce
+        if kelly_size <= 0:
+            effective_max = max(1, effective_max - 1)
+        # In AGGRESSIVE regime with positive Kelly, use full max_positions
 
         # In AGGRESSIVE regime, try to fill up to max_positions
         # In NORMAL, standard behavior
@@ -855,17 +872,33 @@ def backtest_v87(
             new_entries.append((rank_val, si, sym_sector))
             sector_counts[sym_sector] += 1
 
-        # Kelly-based allocation
-        # Use Kelly size as base allocation, distribute among positions
+        # Kelly-informed position COUNT and allocation
+        # Key insight from V80: equal-weight compounding drives returns.
+        # Kelly informs:
+        #  1. Position count (via effective_max) -- already applied
+        #  2. Per-position sizing: equal-weight baseline, Kelly adjusts
+        #     only in extreme situations.
         num_total = len(positions) + len(new_entries)
         if num_total == 0:
             continue
 
-        # Base alloc from Kelly, but ensure at least some minimum exposure
-        # and cap total exposure at LEVERAGE (1.0)
-        alloc_per_pos = min(kelly_size, LEVERAGE / num_total)
-        # Ensure minimum allocation when we have positions
-        alloc_per_pos = max(alloc_per_pos, LEVERAGE / max_positions * 0.3)
+        # Equal-weight allocation among all positions
+        equal_weight = LEVERAGE / num_total
+        alloc_per_pos = equal_weight
+
+        # Kelly-adjusted sizing only when Kelly signals very weak edge
+        # kelly_frac parameter controls sensitivity
+        # Higher kelly_frac => trust Kelly more => more variation in sizing
+        if kelly_size > 0:
+            # Scale between 0.7 and 1.0 based on Kelly fraction param
+            # kelly_frac=0.3 => scale=0.79, kelly_frac=0.7 => scale=0.91
+            # This gives Kelly a mild but real influence on sizing
+            kelly_scale = 0.7 + kelly_size * (1.0 + kelly_frac)
+            kelly_scale = min(kelly_scale, 1.0)
+            alloc_per_pos = equal_weight * kelly_scale
+        else:
+            # No edge detected: reduce to half
+            alloc_per_pos = equal_weight * 0.5
 
         # Update existing positions with new allocation
         updated_positions = []
