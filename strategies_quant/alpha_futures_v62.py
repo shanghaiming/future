@@ -1,1396 +1,1148 @@
 """
-Alpha Futures V62 -- Final Push Toward 600%
-=============================================
-V61 champion: +324.3% annual, 6/6 WF positive, avg +394.9%.
-Config: LOG-biased adaptive, EP40, Z=0.8, MP1, 14 pairs.
+V62: V47 Sector Limit + Extreme Quality Filter
+================================================
+V47 is our ALL-TIME BEST: Sharpe 6.65, MDD 8.8%, ann +19.8%, 112 trades.
+V29 showed that extreme rank (>0.90) produces Sharpe 8.57 but too few trades.
 
-New axes of exploration for 600%:
-  1. Add more pairs beyond 14 (same-group ferrous, metals, soy products)
-  2. Intra-day re-entry: if z still extreme after close, re-enter immediately
-  3. Z-score weighted position sizing: scale by z magnitude, reserve cash
-  4. Multi-day compounding: allow overlapping entries across days
-  5. Adaptive Z threshold: lower Z when vol low, higher when vol high
-  6. Combine best individual improvements
+V62 applies extreme quality filtering to V47:
+  - In WINNING/NORMAL mode: use standard threshold (same as V47)
+  - In LOSING mode: require BOTH high rank AND sector limit AND KER < gate
+  - Minimum composite rank floor: never take weak signals
+  - Skip trading entirely if market is NOT oversold (A/D ratio > threshold)
 
-~200-250 configs. Rigorous 6-window WF for top 5.
+Architecture (same as V47):
+  1. Compute V18's 7 cross-sectional ranks, composite score
+  2. Market breadth: A/D ratio from 5d returns across all commodities
+  3. Dynamic three-mode threshold (WINNING/NORMAL/LOSING)
+  4. Extreme quality filters in LOSING mode
+  5. Sector-constrained greedy selection
+  6. KER gate, hold 5d, ATR stop 3.0, pyramid on day-1 winners
 
-Walk-forward windows:
-  Train 2016-2019, Test 2020
-  Train 2016-2020, Test 2021
-  Train 2016-2021, Test 2022
-  Train 2016-2022, Test 2023
-  Train 2016-2023, Test 2024
-  Train 2016-2024, Test 2025
+Parameter sweep:
+  - min_composite: 0.75, 0.80, 0.85
+  - max_per_sector: 1, 2
+  - losing_thresh: 0.88, 0.90, 0.92
+  - win_rate_window: 10, 15, 20
+  - ker_gate_losing: 0.08, 0.10, 0.15
+  - max_ad_ratio: 0.45, 0.50, 0.55
+
+Walk-forward 2019-2026, full 10-year for top configs.
+Signal at close[di], enter at open[di+1]. No look-ahead. No gap signals.
 """
-import sys, os, time, warnings
+import sys
+import os
+import time
+import warnings
 import numpy as np
-warnings.filterwarnings('ignore')
+import pandas as pd
+from collections import defaultdict
+from itertools import product
+from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from alpha_v2 import load_all_data, MIN_TRAIN, CASH0
 
-MULT = {'agfi': 15, 'alfi': 5, 'aufi': 1000, 'bufi': 10, 'cufi': 5, 'fufi': 10,
-        'rbfi': 10, 'znfi': 5, 'nifi': 1, 'hcfi': 10, 'spfi': 10, 'ssfi': 5,
-        'sffi': 5, 'smfi': 5, 'pbfi': 5, 'snfi': 1, 'rufi': 10, 'wrffi': 10,
-        'afi': 10, 'bfi': 10, 'bbfi': 500, 'cffi': 5, 'cfi': 10, 'csfi': 10,
-        'ebfi': 5, 'egfi': 10, 'fbfi': 500, 'ifi': 100, 'jfi': 100, 'jmfi': 60,
-        'lfi': 5, 'mfi': 10, 'pgfi': 20, 'ppfi': 5, 'vfi': 5, 'yfi': 10,
-        'pfi': 10, 'jdfi': 5, 'lhfi': 16, 'pkfi': 5, 'rrfi': 20, 'lrfi': 20,
-        'jrfi': 20, 'pmfi': 20, 'whfi': 20, 'rsfi': 20, 'cjfi': 10, 'mafi': 10,
-        'apfi': 10, 'cyfi': 5, 'fgfi': 20, 'oifi': 10, 'pfifi': 5, 'rmfi': 10,
-        'srfi': 10, 'tafi': 5, 'safi': 20, 'urfi': 20, 'scfi': 1000, 'lufi': 10,
-        'bcfi': 5, 'nrfi': 1, 'lgfi': 20, 'brfi': 5, 'lcfi': 1, 'sifi': 5,
-        'ni': 1, 'tai': 5}
-DEF_MULT = 10
-COMM = 0.0003
+from alpha_futures_data import load_all_data
 
-# V61's 14 pairs (13 original + cfi/csfi)
-PAIRS_13 = [
-    ('rbfi', 'ifi'), ('hcfi', 'ifi'), ('hcfi', 'rbfi'),
-    ('jfi', 'jmfi'), ('mafi', 'scfi'), ('fufi', 'scfi'),
-    ('bfi', 'scfi'), ('mfi', 'afi'), ('yfi', 'afi'),
-    ('pfi', 'yfi'), ('ppfi', 'mafi'), ('vfi', 'mafi'),
-    ('egfi', 'mafi'),
-]
-PAIRS_14 = PAIRS_13 + [('cfi', 'csfi')]
+try:
+    import talib
+    HAS_TALIB = True
+except ImportError:
+    HAS_TALIB = False
 
-# Extra pairs for testing
-PAIRS_14_P2 = PAIRS_14 + [('jfi', 'ifi'), ('cufi', 'znfi')]
-PAIRS_14_P4 = PAIRS_14_P2 + [('alfi', 'znfi'), ('mfi', 'yfi')]
+CASH0 = 1_000_000
+COMM = 0.0005
 
-PAIR_LABEL = {
-    ('rbfi', 'ifi'):  'rebar/iron_ore',
-    ('hcfi', 'ifi'):  'hotcoil/iron_ore',
-    ('hcfi', 'rbfi'): 'hotcoil/rebar',
-    ('jfi', 'jmfi'):  'coke/coal',
-    ('mafi', 'scfi'): 'methanol/crude',
-    ('fufi', 'scfi'): 'fueloil/crude',
-    ('bfi', 'scfi'):  'bitumen/crude',
-    ('mfi', 'afi'):   'meal/soybean',
-    ('yfi', 'afi'):   'soyoil/soybean',
-    ('pfi', 'yfi'):   'palm/soyoil',
-    ('ppfi', 'mafi'): 'PP/methanol',
-    ('vfi', 'mafi'):  'PVC/methanol',
-    ('egfi', 'mafi'): 'EG/methanol',
-    ('cfi', 'csfi'):  'corn/cornstarch',
-    ('jfi', 'ifi'):   'coke/iron_ore',
-    ('cufi', 'znfi'): 'copper/zinc',
-    ('alfi', 'znfi'): 'aluminum/zinc',
-    ('mfi', 'yfi'):   'meal/soyoil',
+DEFAULT_WEIGHTS = {
+    "rank_ret5d": 0.25,
+    "rank_oi5d": 0.20,
+    "rank_rsi": 0.15,
+    "rank_vol": 0.15,
+    "rank_ret10d": 0.10,
+    "rank_range": 0.10,
+    "rank_atrp": 0.05,
 }
 
-SPREAD_RAW = 'raw'
-SPREAD_PCT = 'pct'
-SPREAD_LOG = 'log'
-ALL_MODES = [SPREAD_RAW, SPREAD_PCT, SPREAD_LOG]
-ALL_LOOKBACKS = [5, 7, 10, 15, 20]
+# Sector definitions for Chinese commodity futures
+SECTOR_MAP = {
+    # BLACK (ferrous metals)
+    'i': 'BLACK', 'j': 'BLACK', 'jm': 'BLACK', 'hc': 'BLACK',
+    'sf': 'BLACK', 'sm': 'BLACK', 'wr': 'BLACK',
+    # METAL (non-ferrous)
+    'cu': 'METAL', 'al': 'METAL', 'zn': 'METAL', 'pb': 'METAL',
+    'ni': 'METAL', 'sn': 'METAL', 'ss': 'METAL', 'ao': 'METAL',
+    # ENERGY
+    'sc': 'ENERGY', 'fu': 'ENERGY', 'bu': 'ENERGY',
+    'pg': 'ENERGY', 'eb': 'ENERGY', 'ta': 'ENERGY',
+    # CHEMICAL
+    'v': 'CHEMICAL', 'pp': 'CHEMICAL', 'l': 'CHEMICAL',
+    'eg': 'CHEMICAL', 'ma': 'CHEMICAL', 'sa': 'CHEMICAL',
+    'ur': 'CHEMICAL', 'pf': 'CHEMICAL', 'sh': 'CHEMICAL',
+    'lc': 'CHEMICAL',
+    # AGRI (oilseeds / agricultural)
+    'm': 'AGRI', 'y': 'AGRI', 'a': 'AGRI', 'p': 'AGRI',
+    'c': 'AGRI', 'cs': 'AGRI', 'jd': 'AGRI', 'rr': 'AGRI',
+    'lrm': 'AGRI',
+    # SOFTS
+    'cf': 'SOFTS', 'sr': 'SOFTS', 'ap': 'SOFTS',
+    'cj': 'SOFTS', 'pk': 'SOFTS', 'lh': 'SOFTS',
+}
 
-# Walk-forward windows: (train_end_year, test_year)
-WF_WINDOWS = [
-    (2019, 2020),
-    (2020, 2021),
-    (2021, 2022),
-    (2022, 2023),
-    (2023, 2024),
-    (2024, 2025),
-]
+
+def build_sector_lookup(syms: List[str]) -> Dict[int, str]:
+    """Build a symbol-index to sector mapping."""
+    sector_lookup: Dict[int, str] = {}
+    for si, sym in enumerate(syms):
+        base = sym.lower().split('.')[0].strip()
+        # Strip digit suffixes (e.g., 'i2401' -> 'i')
+        while base and base[-1].isdigit():
+            base = base[:-1]
+        # Strip 'fi' suffix used by the data loader (e.g., 'cffi' -> 'cf')
+        if base.endswith('fi'):
+            base = base[:-2]
+        sector_lookup[si] = SECTOR_MAP.get(base, 'OTHER')
+    return sector_lookup
 
 
-def main():
-    t_start = time.time()
-    print("=" * 160)
-    print("Alpha Futures V62 -- Final Push Toward 600%")
-    print("V61 champion: +324.3% annual, 6/6 WF positive, avg +394.9%")
-    print("New: more pairs, re-entry, z-weighted sizing, multi-day, adaptive Z, combos")
-    print("=" * 160)
+def compute_rsi_manual(C: np.ndarray, NS: int, ND: int,
+                       period: int = 14) -> np.ndarray:
+    rsi = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        c = C[si]
+        gains = np.full(ND, np.nan)
+        losses = np.full(ND, np.nan)
+        for di in range(1, ND):
+            if np.isnan(c[di]) or np.isnan(c[di - 1]):
+                continue
+            delta = c[di] - c[di - 1]
+            gains[di] = max(delta, 0.0)
+            losses[di] = max(-delta, 0.0)
 
-    NS, ND, dates, C, O, H, L, V, OI, syms, sym_set = load_all_data(load_oi=True)
-    sym_to_si = {syms[si]: si for si in range(NS)}
+        avg_gain = np.nan
+        avg_loss = np.nan
+        for di in range(1, ND):
+            if np.isnan(gains[di]):
+                continue
+            if np.isnan(avg_gain):
+                valid_g = []
+                valid_l = []
+                for j in range(di, min(di + period, ND)):
+                    if not np.isnan(gains[j]):
+                        valid_g.append(gains[j])
+                        valid_l.append(
+                            losses[j] if not np.isnan(losses[j]) else 0.0)
+                if len(valid_g) >= period:
+                    avg_gain = np.mean(valid_g)
+                    avg_loss = np.mean(valid_l)
+                    if avg_loss == 0:
+                        rsi[si, di + period - 1] = 100.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsi[si, di + period - 1] = (
+                            100.0 - 100.0 / (1.0 + rs))
+                continue
 
-    # Year boundaries
-    year_start_di = {}
-    year_end_di = {}
-    for di in range(ND):
-        y = dates[di].year
-        if y not in year_start_di:
-            year_start_di[y] = di
-        year_end_di[y] = di
-    print(f"  {NS} commodities, {ND} days, years in data: {sorted(year_start_di.keys())}")
-
-    # Build pair index mapping for all pair sets
-    def build_pair_indices(pairs_list):
-        indices = []
-        for down_sym, up_sym in pairs_list:
-            down_si = sym_to_si.get(down_sym, -1)
-            up_si = sym_to_si.get(up_sym, -1)
-            if down_si >= 0 and up_si >= 0:
-                indices.append((down_si, up_si, down_sym, up_sym))
+            avg_gain = (avg_gain * (period - 1) + gains[di]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[di]) / period
+            if avg_loss == 0:
+                rsi[si, di] = 100.0
             else:
-                print(f"  WARNING: pair ({down_sym}, {up_sym}) not found")
-        return indices
+                rs = avg_gain / avg_loss
+                rsi[si, di] = 100.0 - 100.0 / (1.0 + rs)
+    return rsi
 
-    pair_indices_14 = build_pair_indices(PAIRS_14)
-    pair_indices_p2 = build_pair_indices(PAIRS_14_P2)
-    pair_indices_p4 = build_pair_indices(PAIRS_14_P4)
 
-    print(f"  Pair sets: P14={len(pair_indices_14)}, P14+2={len(pair_indices_p2)}, P14+4={len(pair_indices_p4)}")
-
-    # ================================================================
-    # PRECOMPUTE SPREADS AND Z-SCORES FOR ALL MODES x LOOKBACKS
-    # ================================================================
-    print("\n[Signals] Precomputing spreads and z-scores...", flush=True)
+def compute_raw_factors(
+    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
+    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
+) -> Dict[str, np.ndarray]:
     t0 = time.time()
+    print("[V62] Computing raw factors...", flush=True)
 
-    z_scores = {m: {} for m in ALL_MODES}
+    ret_5d = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(5, ND):
+            if (not np.isnan(C[si, di])
+                    and not np.isnan(C[si, di - 5])
+                    and C[si, di - 5] > 0):
+                ret_5d[si, di] = C[si, di] / C[si, di - 5] - 1.0
 
-    all_pair_set = set()
-    for pidx in [pair_indices_14, pair_indices_p2, pair_indices_p4]:
-        for down_si, up_si, down_sym, up_sym in pidx:
-            all_pair_set.add((down_si, up_si))
+    ret_10d = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(10, ND):
+            if (not np.isnan(C[si, di])
+                    and not np.isnan(C[si, di - 10])
+                    and C[si, di - 10] > 0):
+                ret_10d[si, di] = C[si, di] / C[si, di - 10] - 1.0
 
-    for down_si, up_si in all_pair_set:
-        key = (down_si, up_si)
-        for mode in ALL_MODES:
-            spread = np.full(ND, np.nan)
-            for di in range(ND):
-                pd_val = C[down_si, di]
-                pu = C[up_si, di]
-                if np.isnan(pd_val) or np.isnan(pu) or pu <= 0 or pd_val <= 0:
-                    continue
-                if mode == SPREAD_RAW:
-                    spread[di] = pd_val - pu
-                elif mode == SPREAD_PCT:
-                    spread[di] = (pd_val - pu) / pu
-                elif mode == SPREAD_LOG:
-                    spread[di] = np.log(pd_val) - np.log(pu)
+    oi_5d = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(5, ND):
+            if (not np.isnan(OI[si, di])
+                    and not np.isnan(OI[si, di - 5])
+                    and OI[si, di - 5] > 0):
+                oi_5d[si, di] = OI[si, di] / OI[si, di - 5] - 1.0
 
-            z_scores[mode][key] = {}
-            for lb in ALL_LOOKBACKS:
-                z = np.full(ND, np.nan)
-                for di in range(lb, ND):
-                    window = spread[di - lb:di]
-                    valid = window[~np.isnan(window)]
-                    if len(valid) >= max(3, lb * 0.8):
-                        m_val = np.mean(valid)
-                        s_val = np.std(valid, ddof=1)
-                        if s_val > 1e-10:
-                            z[di] = (spread[di] - m_val) / s_val
-                z_scores[mode][key][lb] = z
+    vol_5d = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(5, ND):
+            vals = V[si, di - 5:di]
+            valid = vals[~np.isnan(vals)]
+            if len(valid) >= 3:
+                vol_5d[si, di] = np.mean(valid)
 
-    print(f"  Z-scores precomputed ({time.time() - t0:.1f}s)", flush=True)
+    daily_range = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(1, ND):
+            if (not np.isnan(H[si, di])
+                    and not np.isnan(L[si, di])
+                    and not np.isnan(C[si, di])):
+                if C[si, di] > 0 and H[si, di] > L[si, di]:
+                    daily_range[si, di] = (
+                        (H[si, di] - L[si, di]) / C[si, di])
 
-    # ================================================================
-    # PRECOMPUTE SPREAD VOLATILITY (for adaptive Z threshold)
-    # ================================================================
-    print("\n[Signals] Precomputing spread volatility for adaptive Z...", flush=True)
-    t_vol = time.time()
+    rsi14 = np.full((NS, ND), np.nan)
+    if HAS_TALIB:
+        for si in range(NS):
+            c = np.where(np.isnan(C[si]), 0, C[si]).astype(np.float64)
+            nan_mask = np.isnan(C[si])
+            try:
+                r = talib.RSI(c, 14)
+                rsi14[si] = np.where(nan_mask, np.nan, r)
+            except Exception:
+                pass
 
-    # For each pair, compute rolling std of log spread over a lookback
-    spread_vol = {}  # (down_si, up_si) -> {lb: vol_array}
-    for down_si, up_si in all_pair_set:
-        key = (down_si, up_si)
-        spread_vol[key] = {}
-        # Use log spread for vol measurement
-        z_log = z_scores[SPREAD_LOG].get(key, {})
-        for lb in ALL_LOOKBACKS:
-            z_arr = z_log.get(lb)
-            if z_arr is None:
+    needs_fallback = np.all(np.isnan(rsi14), axis=1)
+    if needs_fallback.any():
+        rsi_manual = compute_rsi_manual(C, NS, ND, 14)
+        for si in range(NS):
+            if needs_fallback[si]:
+                rsi14[si] = rsi_manual[si]
+
+    atrp = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(14, ND):
+            atr_vals = []
+            for j in range(di - 14, di):
+                hh, ll, cc = H[si, j], L[si, j], C[si, j]
+                if not any(np.isnan([hh, ll, cc])):
+                    prev_c = (
+                        C[si, j - 1]
+                        if j > 0 and not np.isnan(C[si, j - 1])
+                        else cc
+                    )
+                    atr_vals.append(
+                        max(hh - ll, abs(hh - prev_c), abs(ll - prev_c)))
+            if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
+                atrp[si, di] = np.mean(atr_vals) / C[si, di]
+
+    print(f"  Raw factors done: {time.time() - t0:.1f}s", flush=True)
+    return {
+        "ret_5d": ret_5d,
+        "ret_10d": ret_10d,
+        "oi_5d": oi_5d,
+        "vol_5d": vol_5d,
+        "daily_range": daily_range,
+        "rsi14": rsi14,
+        "atrp": atrp,
+    }
+
+
+def compute_cross_sectional_ranks(
+    raw_factors: Dict[str, np.ndarray],
+    NS: int, ND: int, min_count: int = 10,
+) -> Dict[str, np.ndarray]:
+    t0 = time.time()
+    print("[V62] Computing cross-sectional ranks...", flush=True)
+
+    factors_to_rank = {
+        "rank_ret5d": raw_factors["ret_5d"],
+        "rank_ret10d": raw_factors["ret_10d"],
+        "rank_oi5d": raw_factors["oi_5d"],
+        "rank_vol": raw_factors["vol_5d"],
+        "rank_range": raw_factors["daily_range"],
+        "rank_rsi": raw_factors["rsi14"],
+        "rank_atrp": raw_factors["atrp"],
+    }
+
+    INVERT_FACTORS = {"rank_ret5d", "rank_ret10d", "rank_oi5d", "rank_rsi"}
+
+    ranks = {}
+    for name, factor in factors_to_rank.items():
+        rank_arr = np.full((NS, ND), np.nan)
+        for di in range(ND):
+            vals = factor[:, di]
+            valid_count = np.sum(~np.isnan(vals))
+            if valid_count < min_count:
                 continue
-            # Rolling volatility of the z-score itself (shorter window)
-            vol_window = 20
-            vol_arr = np.full(ND, np.nan)
-            for di in range(vol_window, ND):
-                w = z_arr[di - vol_window:di]
-                valid = w[~np.isnan(w)]
-                if len(valid) >= 5:
-                    vol_arr[di] = np.std(valid, ddof=1)
-            spread_vol[key][lb] = vol_arr
+            ranked = (
+                pd.Series(vals)
+                .rank(pct=True, na_option="keep")
+                .values
+            )
+            if name in INVERT_FACTORS:
+                ranked = 1.0 - ranked
+            rank_arr[:, di] = ranked
+        ranks[name] = rank_arr
 
-    print(f"  Spread volatility precomputed ({time.time() - t_vol:.1f}s)", flush=True)
+    print(f"  CS ranks done: {time.time() - t0:.1f}s", flush=True)
+    return ranks
 
-    # ================================================================
-    # PRECOMPUTE PER-PAIR HYPOTHETICAL RETURNS
-    # ================================================================
-    print("\n[Signals] Precomputing per-pair hypothetical returns...", flush=True)
-    t1 = time.time()
 
-    pair_combo_daily_return = {}
-    all_zt = [0.3, 0.5, 0.8, 1.0, 1.2, 1.5]
-    all_pair_indices = pair_indices_p4  # use largest set for precomputation
-
-    for zt in all_zt:
-        for mode in ALL_MODES:
-            for lb in ALL_LOOKBACKS:
-                combo_key = (mode, lb, zt)
-                for down_si, up_si, down_sym, up_sym in all_pair_indices:
-                    pair_key = (down_si, up_si, down_sym, up_sym)
-                    daily_ret = np.full(ND, np.nan)
-
-                    for di in range(MIN_TRAIN + 1, ND):
-                        z_arr = z_scores[mode].get((down_si, up_si), {}).get(lb)
-                        if z_arr is None:
-                            continue
-                        z_prev = z_arr[di - 1]
-                        if np.isnan(z_prev) or abs(z_prev) < zt:
-                            continue
-
-                        c_down_entry = C[down_si, di - 1]
-                        c_up_entry = C[up_si, di - 1]
-                        c_down_exit = C[down_si, di]
-                        c_up_exit = C[up_si, di]
-                        if (np.isnan(c_down_entry) or c_down_entry <= 0 or
-                            np.isnan(c_up_entry) or c_up_entry <= 0 or
-                            np.isnan(c_down_exit) or c_down_exit <= 0 or
-                            np.isnan(c_up_exit) or c_up_exit <= 0):
-                            continue
-
-                        mult_down = MULT.get(down_sym, DEF_MULT)
-                        mult_up = MULT.get(up_sym, DEF_MULT)
-
-                        if z_prev > 0:
-                            pnl_down = (c_down_entry - c_down_exit) * mult_down
-                            pnl_up = (c_up_exit - c_up_entry) * mult_up
-                        else:
-                            pnl_down = (c_down_exit - c_down_entry) * mult_down
-                            pnl_up = (c_up_entry - c_up_exit) * mult_up
-
-                        invested = c_down_entry * mult_down + c_up_entry * mult_up
-                        cost = invested * COMM * 2
-                        pnl_pct = (pnl_down + pnl_up - cost) / invested * 100 if invested > 0 else 0
-                        daily_ret[di] = pnl_pct
-
-                    pair_combo_daily_return[(pair_key, combo_key)] = daily_ret
-
-    # Global combo daily returns (average across all pairs in use)
-    global_combo_daily_return = {}
-    for zt in all_zt:
-        for mode in ALL_MODES:
-            for lb in ALL_LOOKBACKS:
-                combo_key = (mode, lb, zt)
-                daily_ret = np.full(ND, np.nan)
-                for di in range(MIN_TRAIN + 1, ND):
-                    pair_rets = []
-                    for down_si, up_si, down_sym, up_sym in all_pair_indices:
-                        pk = (down_si, up_si, down_sym, up_sym)
-                        pr = pair_combo_daily_return.get((pk, combo_key))
-                        if pr is not None and not np.isnan(pr[di]):
-                            pair_rets.append(pr[di])
-                    if pair_rets:
-                        daily_ret[di] = np.mean(pair_rets)
-                global_combo_daily_return[combo_key] = daily_ret
-
-    print(f"  Hypothetical returns precomputed ({time.time() - t1:.1f}s)", flush=True)
-
-    # ================================================================
-    # BACKTEST ENGINE (enhanced with re-entry, z-weighted sizing,
-    #   multi-day compounding, adaptive Z)
-    # ================================================================
-    def run_backtest(z_thresh=0.8, hold_max=1, exit_z=0.0, max_pairs=1,
-                     mode_type='adaptive_log_bias',
-                     eval_period=40,
-                     candidate_combos=None,
-                     pair_indices=None,
-                     start_year=None, end_year=None,
-                     reentry=False,
-                     z_weighted_sizing=False,
-                     multi_day=False,
-                     adaptive_z=False,
-                     config_name=""):
-        """
-        Enhanced backtest engine with:
-          reentry: if True, after closing a pair at day end, immediately re-enter
-                   if z is still extreme on the same pair (no cooldown)
-          z_weighted_sizing: if True, scale position size by z-score magnitude
-                   z < 1.0 -> 60% of capital, z 1.0-1.5 -> 80%, z > 1.5 -> 100%
-          multi_day: if True, allow overlapping positions from different days
-                   (close yesterday's + open new one independently)
-          adaptive_z: if True, adapt z_thresh based on recent spread vol
-                   low vol -> use lower Z, high vol -> use higher Z
-        """
-        if pair_indices is None:
-            pair_indices = pair_indices_14
-        if candidate_combos is None:
-            candidate_combos = [(SPREAD_LOG, 10), (SPREAD_LOG, 15), (SPREAD_LOG, 20),
-                                (SPREAD_RAW, 10), (SPREAD_PCT, 10)]
-
-        cash = float(CASH0)
-        trades = []
-        pair_positions = []
-
-        current_combo = candidate_combos[0]
-
-        # Date range
-        start_di = MIN_TRAIN
-        end_di = ND
-        if start_year is not None:
-            if start_year in year_start_di:
-                start_di = year_start_di[start_year]
-            else:
-                return None
-        if end_year is not None:
-            if end_year in year_end_di:
-                end_di = year_end_di[end_year] + 1
-            else:
-                return None
-
-        for di in range(start_di, end_di):
-            year = dates[di].year
-
-            # --- Adaptive evaluation every eval_period days ---
-            if di > start_di:
-                days_since_start = di - start_di
-                if days_since_start % eval_period == 0 and days_since_start >= eval_period:
-                    if mode_type == 'fixed':
-                        pass
-                    else:
-                        best_combo = candidate_combos[0]
-                        best_score = -1e18
-                        for c in candidate_combos:
-                            combo_key = (c[0], c[1], z_thresh)
-                            daily_ret = global_combo_daily_return.get(combo_key)
-                            if daily_ret is None:
-                                continue
-                            window = daily_ret[max(start_di, di - eval_period):di]
-                            valid = window[~np.isnan(window)]
-                            if len(valid) >= 3:
-                                score = np.nansum(valid)
-                            else:
-                                score = -1e10
-                            if score > best_score:
-                                best_score = score
-                                best_combo = c
-                        current_combo = best_combo
-
-            # Determine effective z threshold (possibly adaptive)
-            effective_z = z_thresh
-            if adaptive_z:
-                # Compute average spread vol across all pairs today
-                vol_vals = []
-                use_mode, use_lb_ad = current_combo if mode_type != 'fixed' else candidate_combos[0]
-                for down_si, up_si, _, _ in pair_indices:
-                    v = spread_vol.get((down_si, up_si), {}).get(use_lb_ad)
-                    if v is not None and di < len(v) and not np.isnan(v[di]):
-                        vol_vals.append(v[di])
-                if vol_vals:
-                    avg_vol = np.mean(vol_vals)
-                    # Scale z_thresh: if vol < 0.8 (calm), use lower; if > 1.2 (turbulent), use higher
-                    vol_ratio = avg_vol / 1.0  # 1.0 is "normal"
-                    effective_z = z_thresh * (0.7 + 0.3 * vol_ratio)
-                    effective_z = max(0.3, min(effective_z, 2.0))  # clamp
-
-            # --- Manage existing pair positions ---
-            new_positions = []
-            reentry_candidates = []
-            for pos in pair_positions:
-                p_down_si = pos['down_si']
-                p_up_si = pos['up_si']
-                p_mode = pos['mode']
-                p_lb = pos['lb']
-                z_arr = z_scores[p_mode].get((p_down_si, p_up_si), {}).get(p_lb)
-                if z_arr is None:
-                    new_positions.append(pos)
-                    continue
-                z_now = z_arr[di] if di < len(z_arr) else np.nan
-                days_held = di - pos['entry_di']
-                entry_z = pos['entry_z']
-                pos_dir = pos['dir']
-
-                exit_reason = None
-
-                # Mean reversion exit
-                if not np.isnan(z_now):
-                    if pos_dir == 1 and z_now >= exit_z:
-                        exit_reason = 'mean_rev'
-                    elif pos_dir == -1 and z_now <= -exit_z:
-                        exit_reason = 'mean_rev'
-
-                # Stop loss: z moved further against us
-                if exit_reason is None and not np.isnan(z_now):
-                    if pos_dir == 1 and z_now < entry_z - 1.5:
-                        exit_reason = 'stop_loss'
-                    elif pos_dir == -1 and z_now > entry_z + 1.5:
-                        exit_reason = 'stop_loss'
-
-                # Time exit
-                if exit_reason is None and days_held >= hold_max:
-                    exit_reason = 'time'
-
-                if exit_reason:
-                    c_down = C[p_down_si, di]
-                    c_up = C[p_up_si, di]
-                    if np.isnan(c_down) or c_down <= 0:
-                        c_down = pos['entry_down']
-                    if np.isnan(c_up) or c_up <= 0:
-                        c_up = pos['entry_up']
-
-                    mult_down = MULT.get(pos['down_sym'], DEF_MULT)
-                    mult_up = MULT.get(pos['up_sym'], DEF_MULT)
-                    lots_down = pos['lots_down']
-                    lots_up = pos['lots_up']
-
-                    if pos_dir == 1:
-                        pnl_down = (c_down - pos['entry_down']) * mult_down * lots_down
-                        pnl_up = (pos['entry_up'] - c_up) * mult_up * lots_up
-                    else:
-                        pnl_down = (pos['entry_down'] - c_down) * mult_down * lots_down
-                        pnl_up = (c_up - pos['entry_up']) * mult_up * lots_up
-
-                    entry_val_down = pos['entry_down'] * mult_down * lots_down
-                    entry_val_up = pos['entry_up'] * mult_up * lots_up
-                    exit_val_down = c_down * mult_down * lots_down
-                    exit_val_up = c_up * mult_up * lots_up
-                    cost = (entry_val_down + entry_val_up) * COMM + \
-                           (exit_val_down + exit_val_up) * COMM
-
-                    total_pnl = pnl_down + pnl_up - cost
-                    invested = entry_val_down + entry_val_up
-                    pnl_pct = total_pnl / invested * 100 if invested > 0 else 0
-
-                    if pos_dir == 1:
-                        cash_return = c_down * mult_down * lots_down - c_up * mult_up * lots_up
-                    else:
-                        cash_return = -c_down * mult_down * lots_down + c_up * mult_up * lots_up
-
-                    cash += pos['cash_invested'] + cash_return - (exit_val_down + exit_val_up) * COMM
-
-                    trades.append({
-                        'pnl_abs': total_pnl,
-                        'pnl_pct': pnl_pct,
-                        'days': days_held,
-                        'di': di,
-                        'year': year,
-                        'pair': (pos['down_sym'], pos['up_sym']),
-                        'pair_label': PAIR_LABEL.get((pos['down_sym'], pos['up_sym']), ''),
-                        'dir': pos_dir,
-                        'reason': exit_reason,
-                        'mode': p_mode,
-                        'lb': p_lb,
-                    })
-
-                    # Re-entry: if this pair closed and z still extreme, flag for re-entry
-                    if reentry and not np.isnan(z_now) and abs(z_now) >= effective_z:
-                        reentry_candidates.append((p_down_si, p_up_si,
-                                                   pos['down_sym'], pos['up_sym'], z_now))
-                else:
-                    new_positions.append(pos)
-
-            pair_positions = new_positions
-
-            # --- Check occupied commodities ---
-            occupied = set()
-            for pos in pair_positions:
-                occupied.add(pos['down_si'])
-                occupied.add(pos['up_si'])
-
-            # --- Open new pair positions ---
-            n_can_open = max_pairs - len(pair_positions)
-            if n_can_open <= 0 and not multi_day and not reentry:
+def compute_ker(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
+    """Compute KER (Kaufman Efficiency Ratio) raw 0-1 values."""
+    ker_raw = np.full((NS, ND), np.nan)
+    for si in range(NS):
+        for di in range(10, ND):
+            closes = C[si, di - 10:di + 1]
+            valid = closes[~np.isnan(closes)]
+            if len(valid) < 10 or valid[0] <= 0:
                 continue
+            net_change = abs(valid[-1] - valid[0])
+            total_change = np.sum(np.abs(np.diff(valid)))
+            if total_change > 1e-10:
+                ker_raw[si, di] = net_change / total_change
 
-            # Multi-day: if True, allow up to max_pairs total, including from reentry
-            if multi_day:
-                n_can_open = max(1, max_pairs)  # always check for at least 1
+    return ker_raw
 
-            # Determine which combo to use
-            if mode_type == 'fixed':
-                use_mode, use_lb = candidate_combos[0]
-            else:
-                use_mode, use_lb = current_combo
 
-            candidates = []
+def compute_market_breadth(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
+    """Compute daily A/D ratio (fraction of commodities with positive 5d return)."""
+    t0 = time.time()
+    print("[V62] Computing market breadth...", flush=True)
 
-            # Add re-entry candidates first (high priority)
-            if reentry:
-                for rc_down_si, rc_up_si, rc_down_sym, rc_up_sym, rc_z in reentry_candidates:
-                    if rc_down_si not in occupied and rc_up_si not in occupied:
-                        candidates.append((abs(rc_z), rc_down_si, rc_up_si,
-                                           rc_down_sym, rc_up_sym, rc_z, True))
+    ad_ratio = np.full(ND, np.nan)
+    for di in range(20, ND):
+        rets = []
+        for si in range(NS):
+            c_now = C[si, di]
+            c_5d = C[si, di - 5]
+            if not np.isnan(c_now) and not np.isnan(c_5d) and c_5d > 0:
+                rets.append(c_now / c_5d - 1.0)
+        if len(rets) >= 10:
+            ad_ratio[di] = sum(1 for r in rets if r > 0) / len(rets)
 
-            # Then scan all pairs for new signals
-            for down_si, up_si, down_sym, up_sym in pair_indices:
-                if down_si in occupied or up_si in occupied:
+    print(f"  Breadth done: {time.time() - t0:.1f}s", flush=True)
+    return ad_ratio
+
+
+def build_composite_signal(
+    ranks: Dict[str, np.ndarray],
+    weights: Dict[str, float],
+    NS: int, ND: int,
+    min_factors: int = 4,
+) -> Tuple[np.ndarray, np.ndarray]:
+    t0 = time.time()
+    print("[V62] Building composite signal...", flush=True)
+
+    composite = np.full((NS, ND), np.nan)
+    n_confirm = np.zeros((NS, ND), dtype=int)
+
+    factor_names = list(weights.keys())
+    weight_vals = np.array([weights[k] for k in factor_names])
+
+    for di in range(ND):
+        for si in range(NS):
+            vals = []
+            w_sum = 0.0
+            confirm_count = 0
+            for idx, name in enumerate(factor_names):
+                rank_val = ranks[name][si, di]
+                if np.isnan(rank_val):
                     continue
-                # Skip pairs already in reentry_candidates
-                if reentry and any(r[0] == down_si and r[1] == up_si for r in reentry_candidates):
-                    continue
+                vals.append(rank_val * weight_vals[idx])
+                w_sum += weight_vals[idx]
+                if rank_val > 0.5:
+                    confirm_count += 1
 
-                z_arr = z_scores[use_mode].get((down_si, up_si), {}).get(use_lb)
-                if z_arr is None:
-                    continue
-                z_val = z_arr[di] if di < len(z_arr) else np.nan
-                if np.isnan(z_val):
-                    continue
-                if abs(z_val) < effective_z:
-                    continue
+            if w_sum > 0 and confirm_count >= min_factors:
+                composite[si, di] = sum(vals) / w_sum
+                n_confirm[si, di] = confirm_count
 
-                candidates.append((abs(z_val), down_si, up_si, down_sym, up_sym, z_val, False))
+    print(f"  Composite done: {time.time() - t0:.1f}s", flush=True)
+    return composite, n_confirm
 
-            if not candidates:
-                continue
 
-            candidates.sort(key=lambda x: -x[0])
+def compute_all_signals(
+    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
+    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, np.ndarray]:
+    if weights is None:
+        weights = DEFAULT_WEIGHTS
 
-            # Determine capital per pair based on z-weighted sizing
-            opened = 0
-            for _, down_si, up_si, down_sym, up_sym, z_val, is_reentry in candidates:
-                if not multi_day and opened >= n_can_open:
-                    break
-                if multi_day and opened >= max_pairs:
-                    break
-                if down_si in occupied or up_si in occupied:
-                    continue
+    raw = compute_raw_factors(C, O, H, L, V, OI, NS, ND)
+    ranks = compute_cross_sectional_ranks(raw, NS, ND)
+    ker_raw = compute_ker(C, NS, ND)
+    composite, n_confirm = build_composite_signal(ranks, weights, NS, ND)
+    ad_ratio = compute_market_breadth(C, NS, ND)
 
-                c_down = C[down_si, di]
-                c_up = C[up_si, di]
-                if np.isnan(c_down) or c_down <= 0 or np.isnan(c_up) or c_up <= 0:
-                    continue
+    return {
+        "composite": composite,
+        "n_confirm": n_confirm,
+        "ker_raw": ker_raw,
+        "ad_ratio": ad_ratio,
+        "ranks": ranks,
+    }
 
-                mult_down = MULT.get(down_sym, DEF_MULT)
-                mult_up = MULT.get(up_sym, DEF_MULT)
 
-                # Z-weighted position sizing
-                if z_weighted_sizing:
-                    abs_z = abs(z_val)
-                    if abs_z < 1.0:
-                        size_frac = 0.6
-                    elif abs_z < 1.5:
-                        size_frac = 0.8
-                    else:
-                        size_frac = 1.0
-                else:
-                    size_frac = 1.0
+def compute_atr_at(H: np.ndarray, L: np.ndarray, C: np.ndarray,
+                   si: int, di: int, start_di: int) -> Optional[float]:
+    atr_v = []
+    for j in range(max(start_di, di - 14), di):
+        hh, ll, cc = H[si, j], L[si, j], C[si, j]
+        if not any(np.isnan([hh, ll, cc])):
+            atr_v.append(max(hh - ll, abs(hh - cc), abs(ll - cc)))
+    if atr_v:
+        return np.mean(atr_v)
+    return None
 
-                capital_for_pair = cash * size_frac / max(1, max_pairs)
-                cash_per_leg = capital_for_pair / 2
 
-                lots_down = int(cash_per_leg / (c_down * mult_down * (1 + COMM)))
-                lots_up = int(cash_per_leg / (c_up * mult_up * (1 + COMM)))
-                if lots_down <= 0 or lots_up <= 0:
-                    continue
+def get_dynamic_mode(
+    recent_trades_win: List[int],
+    win_threshold: float,
+    win_rate_window: int,
+) -> str:
+    """Determine trading mode based on recent win rate."""
+    if len(recent_trades_win) < 5:
+        return "normal"
 
-                cost_down = c_down * mult_down * lots_down * (1 + COMM)
-                cost_up = c_up * mult_up * lots_up * (1 + COMM)
-                total_cost = cost_down + cost_up
-                if total_cost > cash:
-                    scale = cash * 0.95 / total_cost
-                    lots_down = max(1, int(lots_down * scale))
-                    lots_up = max(1, int(lots_up * scale))
-                    cost_down = c_down * mult_down * lots_down * (1 + COMM)
-                    cost_up = c_up * mult_up * lots_up * (1 + COMM)
-                    total_cost = cost_down + cost_up
-                    if total_cost > cash:
-                        continue
+    window = recent_trades_win[-win_rate_window:]
+    win_rate = sum(window) / len(window)
 
-                if z_val > 0:
-                    pos_dir = -1
-                else:
-                    pos_dir = 1
+    if win_rate > win_threshold:
+        return "winning"
+    elif win_rate < 0.50:
+        return "losing"
+    return "normal"
 
-                cash -= total_cost
-                pair_positions.append({
-                    'down_si': down_si,
-                    'up_si': up_si,
-                    'down_sym': down_sym,
-                    'up_sym': up_sym,
-                    'entry_down': c_down,
-                    'entry_up': c_up,
-                    'lots_down': lots_down,
-                    'lots_up': lots_up,
-                    'entry_di': di,
-                    'entry_z': z_val,
-                    'dir': pos_dir,
-                    'cash_invested': total_cost,
-                    'mode': use_mode,
-                    'lb': use_lb,
-                })
-                occupied.add(down_si)
-                occupied.add(up_si)
-                opened += 1
 
-        # Close remaining positions at end
-        actual_end = min(end_di, ND) - 1
-        for pos in pair_positions:
-            p_down_si = pos['down_si']
-            p_up_si = pos['up_si']
-            c_down = C[p_down_si, actual_end]
-            c_up = C[p_up_si, actual_end]
-            if np.isnan(c_down) or c_down <= 0:
-                c_down = pos['entry_down']
-            if np.isnan(c_up) or c_up <= 0:
-                c_up = pos['entry_up']
-
-            mult_down = MULT.get(pos['down_sym'], DEF_MULT)
-            mult_up = MULT.get(pos['up_sym'], DEF_MULT)
-            lots_down = pos['lots_down']
-            lots_up = pos['lots_up']
-
-            if pos['dir'] == 1:
-                pnl_down = (c_down - pos['entry_down']) * mult_down * lots_down
-                pnl_up = (pos['entry_up'] - c_up) * mult_up * lots_up
-            else:
-                pnl_down = (pos['entry_down'] - c_down) * mult_down * lots_down
-                pnl_up = (c_up - pos['entry_up']) * mult_up * lots_up
-
-            entry_val_down = pos['entry_down'] * mult_down * lots_down
-            entry_val_up = pos['entry_up'] * mult_up * lots_up
-            exit_val_down = c_down * mult_down * lots_down
-            exit_val_up = c_up * mult_up * lots_up
-            cost = (entry_val_down + entry_val_up) * COMM + \
-                   (exit_val_down + exit_val_up) * COMM
-
-            total_pnl = pnl_down + pnl_up - cost
-            invested = entry_val_down + entry_val_up
-            pnl_pct = total_pnl / invested * 100 if invested > 0 else 0
-
-            if pos['dir'] == 1:
-                cash_return = c_down * mult_down * lots_down - c_up * mult_up * lots_up
-            else:
-                cash_return = -c_down * mult_down * lots_down + c_up * mult_up * lots_up
-
-            cash += pos['cash_invested'] + cash_return - (exit_val_down + exit_val_up) * COMM
-
-            trades.append({
-                'pnl_abs': total_pnl,
-                'pnl_pct': pnl_pct,
-                'days': actual_end - pos['entry_di'],
-                'di': actual_end,
-                'year': dates[actual_end].year,
-                'pair': (pos['down_sym'], pos['up_sym']),
-                'pair_label': PAIR_LABEL.get((pos['down_sym'], pos['up_sym']), ''),
-                'dir': pos['dir'],
-                'reason': 'end',
-                'mode': pos['mode'],
-                'lb': pos['lb'],
-            })
-
-        if len(trades) < 3:
-            return None
-
-        # === STATS ===
-        equity = float(CASH0)
-        peak = float(CASH0)
-        max_dd = 0.0
-        for t in sorted(trades, key=lambda x: x['di']):
-            equity += t['pnl_abs']
-            if equity > peak:
-                peak = equity
-            if peak > 0:
-                dd = (peak - equity) / peak * 100
-                if dd > max_dd:
-                    max_dd = dd
-
-        nw = sum(1 for t in trades if t['pnl_abs'] > 0)
-        wr = nw / len(trades) * 100
-        avg_win = np.mean([t['pnl_pct'] for t in trades if t['pnl_abs'] > 0]) if nw > 0 else 0
-        avg_loss = np.mean([abs(t['pnl_pct']) for t in trades if t['pnl_abs'] <= 0]) if nw < len(trades) else 0
-        avg_days = np.mean([t['days'] for t in trades])
-        pf = (sum(t['pnl_abs'] for t in trades if t['pnl_abs'] > 0) /
-              max(abs(sum(t['pnl_abs'] for t in trades if t['pnl_abs'] < 0)), 1))
-
-        first_di = min(t['di'] for t in trades)
-        last_di = max(t['di'] for t in trades)
-        if last_di > first_di:
-            days_total = (dates[last_di] - dates[first_di]).days
-        else:
-            days_total = 365
-        yr = max(days_total / 365.25, 0.01)
-        ann = ((cash / CASH0) ** (1 / yr) - 1) * 100
-
-        trade_pnls = [t['pnl_abs'] for t in sorted(trades, key=lambda x: x['di'])]
-        if len(trade_pnls) > 1:
-            rets = np.array(trade_pnls) / float(CASH0)
-            sharpe_approx = np.mean(rets) / np.std(rets) * np.sqrt(252) if np.std(rets) > 0 else 0
-        else:
-            sharpe_approx = 0
-
-        year_stats = {}
-        for t in trades:
-            y = t['year']
-            if y not in year_stats:
-                year_stats[y] = {'n': 0, 'w': 0, 'pnl': 0.0, 'pnl_abs_sum': 0.0}
-            year_stats[y]['n'] += 1
-            if t['pnl_abs'] > 0:
-                year_stats[y]['w'] += 1
-            year_stats[y]['pnl'] += t['pnl_pct']
-            year_stats[y]['pnl_abs_sum'] += t['pnl_abs']
-
-        pair_stats = {}
-        for t in trades:
-            p = t['pair_label']
-            if p not in pair_stats:
-                pair_stats[p] = {'n': 0, 'w': 0, 'pnl': 0.0}
-            pair_stats[p]['n'] += 1
-            if t['pnl_abs'] > 0:
-                pair_stats[p]['w'] += 1
-            pair_stats[p]['pnl'] += t['pnl_abs']
-
-        mode_usage = {}
-        for t in trades:
-            m = t.get('mode', '?')
-            lb = t.get('lb', '?')
-            key = f"{m}_LB{lb}"
-            if key not in mode_usage:
-                mode_usage[key] = {'n': 0, 'w': 0, 'pnl': 0.0}
-            mode_usage[key]['n'] += 1
-            if t['pnl_abs'] > 0:
-                mode_usage[key]['w'] += 1
-            mode_usage[key]['pnl'] += t['pnl_abs']
-
+def get_mode_params(
+    mode: str,
+    normal_threshold: float,
+    lose_threshold: float,
+    top_n_winning: int,
+    top_n_normal: int = 2,
+) -> Dict:
+    """Get trading parameters for the given mode."""
+    if mode == "winning":
         return {
-            'name': config_name,
-            'ann': round(ann, 1),
-            'n': len(trades),
-            'wr': round(wr, 1),
-            'dd': round(max_dd, 1),
-            'avg_win': round(avg_win, 2),
-            'avg_loss': round(avg_loss, 2),
-            'avg_days': round(avg_days, 1),
-            'pf': round(pf, 2),
-            'sharpe': round(sharpe_approx, 2),
-            'cash': round(cash, 0),
-            'yearly': year_stats,
-            'pair_stats': pair_stats,
-            'mode_usage': mode_usage,
-            'trades': trades,
+            "threshold": 0.75,
+            "top_n": top_n_winning,
+            "pyramid_ratio": 0.5,
+            "mode_label": "WIN",
+        }
+    elif mode == "losing":
+        return {
+            "threshold": lose_threshold,
+            "top_n": 1,
+            "pyramid_ratio": 0.0,
+            "mode_label": "LOSE",
+        }
+    else:  # normal
+        return {
+            "threshold": normal_threshold,
+            "top_n": top_n_normal,
+            "pyramid_ratio": 0.3,
+            "mode_label": "NORM",
         }
 
-    # ================================================================
-    # BUILD FULL-PERIOD CONFIGURATIONS
-    # ================================================================
-    configs = []
 
-    # V61 champion baseline: LOG-biased adaptive, EP40, Z=0.8, MP1, P14
-    log_bias_combos = [(SPREAD_LOG, 10), (SPREAD_LOG, 15), (SPREAD_LOG, 20),
-                       (SPREAD_RAW, 10), (SPREAD_PCT, 10)]
+def backtest_v62(
+    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
+    NS: int, ND: int, dates: np.ndarray, syms: List[str],
+    sigs: Dict[str, np.ndarray],
+    sector_lookup: Dict[int, str],
+    win_threshold: float = 0.60,
+    normal_threshold: float = 0.82,
+    lose_threshold: float = 0.90,
+    win_rate_window: int = 15,
+    atr_stop: float = 3.0,
+    top_n_winning: int = 2,
+    max_per_sector: int = 1,
+    min_confidence: int = 3,
+    hold_days: int = 5,
+    pyramid_day: int = 1,
+    start_di: int = 60,
+    end_di: Optional[int] = None,
+    # V62 new parameters
+    min_composite: float = 0.80,
+    ker_gate_losing: float = 0.10,
+    max_ad_ratio: float = 0.50,
+) -> Tuple[List[dict], float, float]:
+    """Backtest V62 with extreme quality filtering on top of V47."""
+    composite = sigs["composite"]
+    ker_raw = sigs["ker_raw"]
+    n_confirm = sigs["n_confirm"]
+    ad_ratio = sigs["ad_ratio"]
 
-    # --- Test 1: More pairs (baseline config, varying pair set) ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p2, 'P16'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0]:
-            for mp in [1, 2]:
-                name = f"T1_PAIRS_{pname}_Z{zt:.1f}_MP{mp}"
-                configs.append({
-                    'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                    'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                    'candidate_combos': log_bias_combos,
-                    'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                    'reentry': False, 'z_weighted_sizing': False,
-                    'multi_day': False, 'adaptive_z': False,
-                    'config_name': name,
-                })
+    if end_di is None:
+        end_di = ND - 1
 
-    # --- Test 2: Intra-day re-entry ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0, 1.2]:
-            for mp in [1, 2]:
-                for re in [True, False]:
-                    name = f"T2_RE{int(re)}_{pname}_Z{zt:.1f}_MP{mp}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': re, 'z_weighted_sizing': False,
-                        'multi_day': False, 'adaptive_z': False,
-                        'config_name': name,
-                    })
+    equity = CASH0
+    peak = equity
+    max_dd = 0.0
+    positions: List[Tuple[int, int, float, float, float, bool]] = []
+    trades: List[dict] = []
 
-    # --- Test 3: Z-score weighted position sizing ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0, 1.2]:
-            for mp in [1, 2]:
-                for zw in [True, False]:
-                    name = f"T3_ZW{int(zw)}_{pname}_Z{zt:.1f}_MP{mp}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': False, 'z_weighted_sizing': zw,
-                        'multi_day': False, 'adaptive_z': False,
-                        'config_name': name,
-                    })
+    recent_trades_win: List[int] = []
 
-    # --- Test 4: Multi-day compounding ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0]:
-            for mp in [1, 2]:
-                for md in [True, False]:
-                    name = f"T4_MD{int(md)}_{pname}_Z{zt:.1f}_MP{mp}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': False, 'z_weighted_sizing': False,
-                        'multi_day': md, 'adaptive_z': False,
-                        'config_name': name,
-                    })
+    for di in range(max(start_di, 1), end_di):
+        d = dates[di]
+        daily_pnl = 0.0
+        new_positions: List[Tuple[int, int, float, float, float, bool]] = []
 
-    # --- Test 5: Adaptive Z threshold ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0, 1.2]:
-            for mp in [1, 2]:
-                for az in [True, False]:
-                    name = f"T5_AZ{int(az)}_{pname}_Z{zt:.1f}_MP{mp}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': False, 'z_weighted_sizing': False,
-                        'multi_day': False, 'adaptive_z': az,
-                        'config_name': name,
-                    })
+        # Determine current mode and parameters
+        mode = get_dynamic_mode(
+            recent_trades_win, win_threshold, win_rate_window)
+        mode_params = get_mode_params(
+            mode, normal_threshold, lose_threshold, top_n_winning)
+        current_threshold = mode_params["threshold"]
+        current_top_n = mode_params["top_n"]
+        current_pyramid_ratio = mode_params["pyramid_ratio"]
+        current_mode_label = mode_params["mode_label"]
 
-    # --- Test 6: Combined best improvements ---
-    # Combine top features: reentry + z_weighted + more pairs
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p2, 'P16'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0]:
-            for mp in [1, 2]:
-                for re in [True, False]:
-                    for zw in [True, False]:
-                        # Skip all-false (already tested in T1)
-                        if not re and not zw:
-                            continue
-                        name = f"T6_RE{int(re)}_ZW{int(zw)}_{pname}_Z{zt:.1f}_MP{mp}"
-                        configs.append({
-                            'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                            'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                            'candidate_combos': log_bias_combos,
-                            'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                            'reentry': re, 'z_weighted_sizing': zw,
-                            'multi_day': False, 'adaptive_z': False,
-                            'config_name': name,
-                        })
+        pos_by_si: Dict[int, List] = defaultdict(list)
+        for si, edi, ep, sp, alloc, is_pyr in positions:
+            pos_by_si[si].append((edi, ep, sp, alloc, is_pyr))
 
-    # --- Test 7: Kitchen sink -- combine ALL enhancements ---
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.8, 1.0]:
-            for mp in [1, 2]:
-                name = f"T7_ALL_{pname}_Z{zt:.1f}_MP{mp}"
-                configs.append({
-                    'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': mp,
-                    'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                    'candidate_combos': log_bias_combos,
-                    'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                    'reentry': True, 'z_weighted_sizing': True,
-                    'multi_day': True, 'adaptive_z': True,
-                    'config_name': name,
-                })
-
-    # --- Test 8: Vary eval period with best enhancements ---
-    for ep in [30, 40, 60, 80]:
-        for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-            for zt in [0.8, 1.0]:
-                name = f"T8_EP{ep}_{pname}_Z{zt:.1f}"
-                configs.append({
-                    'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': 1,
-                    'mode_type': 'adaptive_log_bias', 'eval_period': ep,
-                    'candidate_combos': log_bias_combos,
-                    'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                    'reentry': True, 'z_weighted_sizing': True,
-                    'multi_day': False, 'adaptive_z': False,
-                    'config_name': name,
-                })
-
-    # --- Test 9: MP=2 focused -- reentry+zweight to exploit 2 slots ---
-    # With MP=2, both reentry AND z-weighted sizing matter more
-    for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-        for zt in [0.5, 0.8, 1.0, 1.2]:
-            for ep in [40, 60]:
-                for md in [True, False]:
-                    name = f"T9_MD{int(md)}_{pname}_Z{zt:.1f}_EP{ep}_MP2"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': 2,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': ep,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': True, 'z_weighted_sizing': True,
-                        'multi_day': md, 'adaptive_z': False,
-                        'config_name': name,
-                    })
-
-    # --- Test 10: Hold 2 days with reentry ---
-    # Longer hold might let winners run, reentry catches new signals
-    for hold in [2, 3]:
-        for pidx, pname in [(pair_indices_14, 'P14'), (pair_indices_p4, 'P18')]:
-            for zt in [0.8, 1.0]:
-                for mp in [1, 2]:
-                    name = f"T10_H{hold}_{pname}_Z{zt:.1f}_MP{mp}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': hold, 'exit_z': 0.0, 'max_pairs': mp,
-                        'mode_type': 'adaptive_log_bias', 'eval_period': 40,
-                        'candidate_combos': log_bias_combos,
-                        'pair_indices': pidx, 'start_year': None, 'end_year': None,
-                        'reentry': True, 'z_weighted_sizing': False,
-                        'multi_day': False, 'adaptive_z': False,
-                        'config_name': name,
-                    })
-
-    # --- Test 11: Pure LOG fixed with reentry+zweight ---
-    # Go back to fixed LOG with the best combos, add enhancements
-    for lb in [5, 7, 10, 15]:
-        for zt in [0.5, 0.8, 1.0]:
-            for re in [True, False]:
-                for zw in [True, False]:
-                    if not re and not zw:
-                        continue
-                    name = f"T11_LOG_LB{lb}_Z{zt:.1f}_RE{int(re)}_ZW{int(zw)}"
-                    configs.append({
-                        'z_thresh': zt, 'hold_max': 1, 'exit_z': 0.0, 'max_pairs': 1,
-                        'mode_type': 'fixed', 'eval_period': 40,
-                        'candidate_combos': [(SPREAD_LOG, lb)],
-                        'pair_indices': pair_indices_14, 'start_year': None, 'end_year': None,
-                        'reentry': re, 'z_weighted_sizing': zw,
-                        'multi_day': False, 'adaptive_z': False,
-                        'config_name': name,
-                    })
-
-    total_combos = len(configs)
-    print(f"\n{'=' * 160}")
-    print(f"  FULL-PERIOD PARAMETER SWEEP ({total_combos} configs)")
-    print(f"  T1:  More pairs (P14/P16/P18 x Z[0.8,1.0] x MP[1,2])")
-    print(f"  T2:  Intra-day re-entry (RE x P14/P18 x Z[0.8,1.0,1.2] x MP[1,2])")
-    print(f"  T3:  Z-score weighted sizing (ZW x P14/P18 x Z[0.8,1.0,1.2] x MP[1,2])")
-    print(f"  T4:  Multi-day compounding (MD x P14/P18 x Z[0.8,1.0] x MP[1,2])")
-    print(f"  T5:  Adaptive Z threshold (AZ x P14/P18 x Z[0.8,1.0,1.2] x MP[1,2])")
-    print(f"  T6:  Combined RE+ZW (P14/P16/P18 x Z[0.8,1.0] x MP[1,2])")
-    print(f"  T7:  Kitchen sink ALL (P14/P18 x Z[0.8,1.0] x MP[1,2])")
-    print(f"  T8:  Eval period sweep with RE+ZW (EP[30,40,60,80] x P14/P18 x Z[0.8,1.0])")
-    print(f"  T9:  MP=2 focused (P14/P18 x Z[0.5,0.8,1.0,1.2] x EP[40,60] x MD[0,1])")
-    print(f"  T10: Hold 2-3 days with reentry (P14/P18 x Z[0.8,1.0] x MP[1,2])")
-    print(f"  T11: Fixed LOG with RE/ZW (LB[5,7,10,15] x Z[0.5,0.8,1.0] x RE/ZW)")
-    print(f"{'=' * 160}")
-
-    results = []
-    t_sweep_start = time.time()
-
-    for ci, cfg in enumerate(configs):
-        r = run_backtest(**cfg)
-        if r is not None:
-            results.append(r)
-
-        if (ci + 1) % 50 == 0:
-            elapsed = time.time() - t_sweep_start
-            print(f"  [{ci + 1}/{total_combos}] {len(results)} with results ({elapsed:.1f}s)", flush=True)
-
-    results.sort(key=lambda x: -x['ann'])
-    print(f"\n  Sweep complete: {len(results)}/{total_combos} configs ({time.time() - t_sweep_start:.1f}s)",
-          flush=True)
-
-    # ================================================================
-    # TOP 20 FULL-PERIOD RESULTS
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  TOP 20 FULL-PERIOD RESULTS")
-    print(f"{'=' * 160}")
-    print(f"  {'#':>2s} | {'Config':50s} | {'Ann':>8s} | {'WR':>5s} | {'N':>5s} | "
-          f"{'DD':>6s} | {'PF':>5s} | {'Sharpe':>7s} | {'AvgW':>6s} | {'AvgL':>6s} | "
-          f"{'AvgD':>5s} | {'Cash':>12s}")
-    print(f"  {'-' * 160}")
-
-    for i, r in enumerate(results[:20]):
-        print(f"  {i + 1:2d} | {r['name']:50s} | {r['ann']:+7.1f}% | {r['wr']:4.1f}% | "
-              f"{r['n']:5d} | {r['dd']:5.1f}% | {r['pf']:4.2f} | {r['sharpe']:6.2f} | "
-              f"{r['avg_win']:+5.2f}% | {r['avg_loss']:5.2f}% | {r['avg_days']:4.1f} | "
-              f"{r['cash']:11.0f}")
-
-    # ================================================================
-    # PAIR COUNT COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  PAIR COUNT COMPARISON")
-    print(f"{'=' * 160}")
-
-    for pset_name in ['P14', 'P16', 'P18']:
-        subset = [r for r in results if f'_{pset_name}_' in r['name']]
-        if subset:
-            avg_ann = np.mean([r['ann'] for r in subset])
-            best = max(subset, key=lambda x: x['ann'])
-            n_pos = sum(1 for r in subset if r['ann'] > 0)
-            print(f"  {pset_name}: N={len(subset)}  Avg Ann={avg_ann:+.1f}%  "
-                  f"Best Ann={best['ann']:+.1f}%  Positive={n_pos}/{len(subset)}")
-            print(f"    Best: {best['name']}  Ann={best['ann']:+.1f}%  WR={best['wr']:.1f}%  "
-                  f"DD={best['dd']:.1f}%  PF={best['pf']:.2f}  Sharpe={best['sharpe']:.2f}")
-
-    # ================================================================
-    # REENTRY COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  REENTRY COMPARISON")
-    print(f"{'=' * 160}")
-
-    for re_val, re_label in [(True, 'RE_ON'), (False, 'RE_OFF')]:
-        subset = [r for r in results if f'_RE{int(re_val)}_' in r['name']]
-        if subset:
-            avg_ann = np.mean([r['ann'] for r in subset])
-            best = max(subset, key=lambda x: x['ann'])
-            avg_n = np.mean([r['n'] for r in subset])
-            print(f"  {re_label}: N={len(subset)}  Avg Ann={avg_ann:+.1f}%  Avg Trades={avg_n:.0f}  "
-                  f"Best Ann={best['ann']:+.1f}%")
-            print(f"    Best: {best['name']}")
-
-    # ================================================================
-    # Z-WEIGHTED SIZING COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  Z-WEIGHTED SIZING COMPARISON")
-    print(f"{'=' * 160}")
-
-    for zw_val, zw_label in [(True, 'ZW_ON'), (False, 'ZW_OFF')]:
-        subset = [r for r in results if f'_ZW{int(zw_val)}_' in r['name']]
-        if subset:
-            avg_ann = np.mean([r['ann'] for r in subset])
-            best = max(subset, key=lambda x: x['ann'])
-            print(f"  {zw_label}: N={len(subset)}  Avg Ann={avg_ann:+.1f}%  "
-                  f"Best Ann={best['ann']:+.1f}%")
-            print(f"    Best: {best['name']}")
-
-    # ================================================================
-    # MULTI-DAY COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  MULTI-DAY COMPOUNDING COMPARISON")
-    print(f"{'=' * 160}")
-
-    for md_val, md_label in [(True, 'MD_ON'), (False, 'MD_OFF')]:
-        subset = [r for r in results if f'_MD{int(md_val)}_' in r['name']]
-        if subset:
-            avg_ann = np.mean([r['ann'] for r in subset])
-            best = max(subset, key=lambda x: x['ann'])
-            print(f"  {md_label}: N={len(subset)}  Avg Ann={avg_ann:+.1f}%  "
-                  f"Best Ann={best['ann']:+.1f}%")
-            print(f"    Best: {best['name']}")
-
-    # ================================================================
-    # ADAPTIVE Z COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  ADAPTIVE Z THRESHOLD COMPARISON")
-    print(f"{'=' * 160}")
-
-    for az_val, az_label in [(True, 'AZ_ON'), (False, 'AZ_OFF')]:
-        subset = [r for r in results if f'_AZ{int(az_val)}_' in r['name']]
-        if subset:
-            avg_ann = np.mean([r['ann'] for r in subset])
-            best = max(subset, key=lambda x: x['ann'])
-            print(f"  {az_label}: N={len(subset)}  Avg Ann={avg_ann:+.1f}%  "
-                  f"Best Ann={best['ann']:+.1f}%")
-            print(f"    Best: {best['name']}")
-
-    # ================================================================
-    # TEST GROUP COMPARISON
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  TEST GROUP COMPARISON (best per test)")
-    print(f"{'=' * 160}")
-
-    for test_id in ['T1_', 'T2_', 'T3_', 'T4_', 'T5_', 'T6_', 'T7_', 'T8_', 'T9_', 'T10_', 'T11_']:
-        subset = [r for r in results if r['name'].startswith(test_id)]
-        if subset:
-            best = max(subset, key=lambda x: x['ann'])
-            avg_ann = np.mean([r['ann'] for r in subset])
-            print(f"  {test_id.strip('_'):3s}: N={len(subset):3d}  Avg={avg_ann:+7.1f}%  "
-                  f"Best={best['ann']:+7.1f}%  | {best['name']}")
-        else:
-            print(f"  {test_id.strip('_'):3s}: no results")
-
-    # ================================================================
-    # PER-PAIR STATS (for #1 overall config)
-    # ================================================================
-    if results:
-        best_overall = results[0]
-        print(f"\n{'=' * 160}")
-        print(f"  PER-PAIR STATS for #1 Config: {best_overall['name']}")
-        print(f"  Ann={best_overall['ann']:+.1f}%  WR={best_overall['wr']:.1f}%  "
-              f"N={best_overall['n']}  DD={best_overall['dd']:.1f}%  PF={best_overall['pf']:.2f}  "
-              f"Sharpe={best_overall['sharpe']:.2f}")
-        print(f"{'=' * 160}")
-        print(f"  {'Pair':25s} | {'N':>5s} | {'WR':>5s} | {'Abs PnL':>12s} | {'Avg PnL':>10s}")
-        print(f"  {'-' * 70}")
-
-        for p in sorted(best_overall['pair_stats'].keys(),
-                        key=lambda x: -best_overall['pair_stats'][x]['pnl']):
-            ps = best_overall['pair_stats'][p]
-            wr_p = ps['w'] / max(ps['n'], 1) * 100
-            avg_pnl = ps['pnl'] / max(ps['n'], 1)
-            print(f"  {p:25s} | {ps['n']:5d} | {wr_p:4.1f}% | {ps['pnl']:+11.0f} | "
-                  f"{avg_pnl:+9.0f}")
-
-        # Mode usage for #1 config
-        if best_overall.get('mode_usage'):
-            print(f"\n  SPREAD MODE USAGE for #1 config:")
-            for mode_key in sorted(best_overall['mode_usage'].keys(),
-                                   key=lambda x: -best_overall['mode_usage'][x]['n']):
-                mu = best_overall['mode_usage'][mode_key]
-                wr_m = mu['w'] / max(mu['n'], 1) * 100
-                print(f"    {mode_key:15s}: {mu['n']:5d} trades  WR={wr_m:5.1f}%  "
-                      f"PnL={mu['pnl']:+12.0f}")
-
-        # Year-by-year for #1 config
-        print(f"\n  Year-by-year breakdown for #1 config:")
-        print(f"  {'Year':>6s} | {'N':>5s} | {'WR':>5s} | {'PnL Abs':>12s} | {'PnL %':>8s}")
-        print(f"  {'-' * 50}")
-        for y in sorted(best_overall['yearly'].keys()):
-            ys = best_overall['yearly'][y]
-            wr_y = ys['w'] / max(ys['n'], 1) * 100
-            print(f"  {y:6d} | {ys['n']:5d} | {wr_y:4.1f}% | {ys['pnl_abs_sum']:+11.0f} | "
-                  f"{ys['pnl']:+7.1f}%")
-
-    # ================================================================
-    # YEARLY FOR TOP 5
-    # ================================================================
-    if len(results) >= 2:
-        print(f"\n  YEARLY BREAKDOWN FOR TOP 5 CONFIGS:")
-        for idx, r in enumerate(results[:5]):
-            print(f"\n  #{idx + 1}: {r['name']} (Ann={r['ann']:+.1f}%, WR={r['wr']:.1f}%, "
-                  f"DD={r['dd']:.1f}%, Sharpe={r['sharpe']:.2f}, N={r['n']})")
-            for y in sorted(r['yearly'].keys()):
-                ys = r['yearly'][y]
-                wr_y = ys['w'] / ys['n'] * 100 if ys['n'] > 0 else 0
-                print(f"    {y}: {ys['n']:4d}t  WR={wr_y:5.1f}%  PnL={ys['pnl']:+.1f}%")
-
-    # ================================================================
-    # RIGOROUS WALK-FORWARD FOR TOP 5 CONFIGS
-    # ================================================================
-    top5_for_wf = results[:5]
-
-    print(f"\n{'=' * 160}")
-    print(f"  RIGOROUS 6-WINDOW WALK-FORWARD (Top 5 configs)")
-    print(f"  Windows: {WF_WINDOWS}")
-    print(f"{'=' * 160}")
-
-    wf_all = []
-    wf_by_config = {}
-
-    for rank, cfg in enumerate(top5_for_wf):
-        cfg_name = cfg['name']
-        matching = [c for c in configs if c['config_name'] == cfg_name]
-        if not matching:
-            print(f"  [{rank + 1}] {cfg_name} -- config not found, SKIP")
-            continue
-
-        base_cfg = matching[0]
-        print(f"\n  [{rank + 1}] {cfg_name}  (full-period Ann={cfg['ann']:+.1f}%)")
-
-        for train_end, test_year in WF_WINDOWS:
-            if test_year not in year_start_di:
-                print(f"    Train -{train_end}/Test {test_year}: year not in data, SKIP")
+        for si, pos_list in pos_by_si.items():
+            c = C[si, di]
+            if np.isnan(c):
+                for edi, ep, sp, alloc, is_pyr in pos_list:
+                    new_positions.append(
+                        (si, edi, ep, sp, alloc, is_pyr))
                 continue
 
-            wf_name = f"WF_Train-{train_end}_Test-{test_year}_{cfg_name}"
-            wf_cfg = dict(base_cfg)
-            wf_cfg['start_year'] = test_year
-            wf_cfg['end_year'] = test_year
-            wf_cfg['config_name'] = wf_name
+            earliest_edi = min(p[0] for p in pos_list)
+            hold = di - earliest_edi
+            stopped = any(c < sp for _, _, sp, _, _ in pos_list)
 
-            r = run_backtest(**wf_cfg)
-            if r is not None:
-                wf_all.append((cfg_name, train_end, test_year, r))
-                if cfg_name not in wf_by_config:
-                    wf_by_config[cfg_name] = []
-                wf_by_config[cfg_name].append((train_end, test_year, r))
-                print(f"    Train -{train_end}/Test {test_year}: Ann={r['ann']:+7.1f}%  "
-                      f"WR={r['wr']:5.1f}%  N={r['n']:4d}  DD={r['dd']:5.1f}%  "
-                      f"PF={r['pf']:4.2f}  Sharpe={r['sharpe']:6.2f}")
+            if stopped:
+                for edi, ep, sp, alloc, is_pyr in pos_list:
+                    pnl = (c - ep) / ep - COMM
+                    profit = equity * alloc * pnl
+                    daily_pnl += profit
+                    is_win = pnl > 0
+                    trades.append({
+                        "pnl_abs": profit,
+                        "pnl_pct": pnl * 100,
+                        "days": di - edi + 1,
+                        "di": di,
+                        "year": d.year,
+                        "sym": syms[si],
+                        "sector": sector_lookup.get(si, 'OTHER'),
+                        "reason": "stop",
+                        "pyr": is_pyr,
+                        "mode": current_mode_label,
+                        "threshold": current_threshold,
+                    })
+                    recent_trades_win.append(1 if is_win else 0)
+            elif hold >= hold_days:
+                for edi, ep, sp, alloc, is_pyr in pos_list:
+                    pnl = (c - ep) / ep - COMM
+                    profit = equity * alloc * pnl
+                    daily_pnl += profit
+                    is_win = pnl > 0
+                    trades.append({
+                        "pnl_abs": profit,
+                        "pnl_pct": pnl * 100,
+                        "days": di - edi + 1,
+                        "di": di,
+                        "year": d.year,
+                        "sym": syms[si],
+                        "sector": sector_lookup.get(si, 'OTHER'),
+                        "reason": "hold",
+                        "pyr": is_pyr,
+                        "mode": current_mode_label,
+                        "threshold": current_threshold,
+                    })
+                    recent_trades_win.append(1 if is_win else 0)
             else:
-                print(f"    Train -{train_end}/Test {test_year}: insufficient trades")
+                for edi, ep, sp, alloc, is_pyr in pos_list:
+                    new_positions.append(
+                        (si, edi, ep, sp, alloc, is_pyr))
 
-    # ================================================================
-    # WALK-FORWARD AGGREGATE
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  WALK-FORWARD AGGREGATE (average across all windows per config)")
-    print(f"{'=' * 160}")
+        # Pyramid on day-1 winners (ratio varies by mode)
+        if current_pyramid_ratio > 0:
+            held_with_pos: Dict[int, List] = defaultdict(list)
+            for si, edi, ep, sp, alloc, is_pyr in new_positions:
+                held_with_pos[si].append((edi, ep, sp, alloc, is_pyr))
 
-    wf_avg = []
-    for cfg_name, window_results in wf_by_config.items():
-        anns = [r['ann'] for _, _, r in window_results]
-        wrs = [r['wr'] for _, _, r in window_results]
-        ns = [r['n'] for _, _, r in window_results]
-        dds = [r['dd'] for _, _, r in window_results]
-        pfs = [r['pf'] for _, _, r in window_results]
-        sharpe_vals = [r['sharpe'] for _, _, r in window_results]
-        n_positive = sum(1 for a in anns if a > 0)
+            additions = []
+            for si, pos_list in held_with_pos.items():
+                has_pyr = any(is_pyr for _, _, _, _, is_pyr in pos_list)
+                if has_pyr:
+                    continue
+                earliest_edi = min(p[0] for p in pos_list)
+                hold = di - earliest_edi
+                if hold == pyramid_day and not np.isnan(C[si, di]):
+                    avg_ep = np.mean([ep for _, ep, _, _, _ in pos_list])
+                    if C[si, di] > avg_ep:
+                        base_alloc = sum(a for _, _, _, a, _ in pos_list)
+                        pyr_alloc = base_alloc * current_pyramid_ratio
+                        c_now = C[si, di]
+                        atr = compute_atr_at(H, L, C, si, di, start_di)
+                        if atr is not None:
+                            additions.append(
+                                (si, di, c_now,
+                                 c_now - atr_stop * atr,
+                                 pyr_alloc, True))
+            new_positions.extend(additions)
 
-        wf_avg.append({
-            'name': cfg_name,
-            'avg_ann': np.mean(anns),
-            'med_ann': np.median(anns),
-            'min_ann': min(anns),
-            'max_ann': max(anns),
-            'avg_wr': np.mean(wrs),
-            'avg_n': np.mean(ns),
-            'avg_dd': np.mean(dds),
-            'avg_pf': np.mean(pfs),
-            'avg_sharpe': np.mean(sharpe_vals),
-            'n_positive': n_positive,
-            'n_windows': len(window_results),
-            'window_details': window_results,
-        })
+        positions = new_positions
+        equity += daily_pnl
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (peak - equity) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+        if equity <= 0:
+            break
 
-    wf_avg.sort(key=lambda x: -x['avg_ann'])
+        held = {p[0] for p in positions}
+        if len(positions) >= current_top_n:
+            continue
 
-    print(f"  {'#':>2s} | {'Config':50s} | {'Avg Ann':>8s} | {'Med Ann':>8s} | {'Min Ann':>8s} | "
-          f"{'Max Ann':>8s} | {'Avg WR':>6s} | {'Avg N':>6s} | {'Avg DD':>7s} | {'Avg PF':>6s} | "
-          f"{'Avg Sh':>6s} | {'Pos/Win':>7s}")
-    print(f"  {'-' * 170}")
+        # V62: Skip new entries if market is not oversold
+        market_oversold = (
+            np.isnan(ad_ratio[di]) or ad_ratio[di] <= max_ad_ratio
+        )
+        if not market_oversold:
+            continue
 
-    for i, w in enumerate(wf_avg):
-        print(f"  {i + 1:2d} | {w['name']:50s} | {w['avg_ann']:+7.1f}% | {w['med_ann']:+7.1f}% | "
-              f"{w['min_ann']:+7.1f}% | {w['max_ann']:+7.1f}% | {w['avg_wr']:5.1f}% | "
-              f"{w['avg_n']:5.0f} | {w['avg_dd']:6.1f}% | {w['avg_pf']:5.2f} | "
-              f"{w['avg_sharpe']:5.2f} | {w['n_positive']}/{w['n_windows']}")
-
-    # ================================================================
-    # WALK-FORWARD WINDOW-BY-WINDOW DETAIL
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  WALK-FORWARD WINDOW-BY-WINDOW DETAIL")
-    print(f"{'=' * 160}")
-
-    for i, w in enumerate(wf_avg):
-        print(f"\n  [{i + 1}] {w['name']}:")
-        print(f"  {'Train':>9s} | {'Test':>4s} | {'Ann':>8s} | {'WR':>5s} | {'N':>5s} | "
-              f"{'DD':>6s} | {'PF':>5s} | {'Sharpe':>7s} | {'AvgW':>6s} | {'AvgL':>6s}")
-        print(f"  {'-' * 85}")
-        for train_end, test_year, r in sorted(w['window_details'], key=lambda x: x[1]):
-            print(f"  -{train_end:4d}    | {test_year:4d} | {r['ann']:+7.1f}% | {r['wr']:4.1f}% | "
-                  f"{r['n']:5d} | {r['dd']:5.1f}% | {r['pf']:4.2f} | {r['sharpe']:6.2f} | "
-                  f"{r['avg_win']:+5.2f}% | {r['avg_loss']:5.2f}%")
-
-    # ================================================================
-    # OVERFITTING CHECK
-    # ================================================================
-    if wf_avg:
-        print(f"\n{'=' * 160}")
-        print(f"  OVERFITTING CHECK: Full-Period vs Walk-Forward Correlation")
-        print(f"{'=' * 160}")
-
-        full_anns = []
-        wf_anns_list = []
-        for w in wf_avg:
-            name = w['name']
-            full_r = next((r for r in results if r['name'] == name), None)
-            if full_r:
-                full_anns.append(full_r['ann'])
-                wf_anns_list.append(w['avg_ann'])
-
-        if len(full_anns) > 2:
-            corr = np.corrcoef(full_anns, wf_anns_list)[0, 1]
-            decay = np.mean(wf_anns_list) / max(np.mean(full_anns), 0.01)
-            print(f"  Configs tested OOS: {len(full_anns)}")
-            print(f"  Full-period avg Ann: {np.mean(full_anns):+.1f}%")
-            print(f"  WF avg Ann:          {np.mean(wf_anns_list):+.1f}%")
-            print(f"  Correlation:         {corr:.3f}")
-            print(f"  Decay ratio:         {decay:.2f}")
-
-            if corr > 0.5:
-                print(f"  -> GOOD: Strong positive correlation, training predicts OOS")
-            elif corr > 0.2:
-                print(f"  -> MODERATE: Some predictive power")
+        # Entry signal at close[di], enter at open[di+1]
+        candidates = []
+        for si in range(NS):
+            if si in held:
+                continue
+            if np.isnan(composite[si, di]):
+                continue
+            if composite[si, di] < current_threshold:
+                continue
+            # V62: Minimum composite floor -- never take weak signals
+            if composite[si, di] < min_composite:
+                continue
+            if n_confirm[si, di] < min_confidence:
+                continue
+            # KER gate: stricter for LOSING mode, standard for others
+            ker_val = ker_raw[si, di]
+            if mode == "losing":
+                if np.isnan(ker_val) or ker_val > ker_gate_losing:
+                    continue
             else:
-                print(f"  -> WARNING: Weak/no correlation, possible overfitting")
+                # Standard KER gate (reject noisy instruments)
+                if not np.isnan(ker_val) and ker_val > 0.30:
+                    continue
+            if di + 1 >= ND or np.isnan(O[si, di + 1]):
+                continue
+            alloc = 1.0 / max(current_top_n, 1)
+            candidates.append((composite[si, di], si, alloc))
 
-        # WF positive rate
-        all_wf_anns = [r['ann'] for _, _, _, r in wf_all]
-        n_pos_wf = sum(1 for a in all_wf_anns if a > 0)
-        print(f"\n  Overall WF positive rate: {n_pos_wf}/{len(all_wf_anns)} "
-              f"({n_pos_wf / len(all_wf_anns) * 100:.0f}%)")
+        # Sort by composite score (highest first)
+        candidates.sort(key=lambda x: -x[0])
 
-        if wf_all:
-            best_single = max(wf_all, key=lambda x: x[3]['ann'])
-            worst_single = min(wf_all, key=lambda x: x[3]['ann'])
-            print(f"  Best single window OOS:  Test {best_single[2]} = "
-                  f"{best_single[3]['ann']:+.1f}% ({best_single[0][:50]})")
-            print(f"  Worst single window OOS: Test {worst_single[2]} = "
-                  f"{worst_single[3]['ann']:+.1f}% ({worst_single[0][:50]})")
+        # Sector-constrained greedy selection
+        sector_counts: Dict[str, int] = defaultdict(int)
+        for si_held in held:
+            sector_counts[sector_lookup.get(si_held, 'OTHER')] += 1
 
-    # ================================================================
-    # PAIR PROFITABILITY ACROSS TOP 20
-    # ================================================================
-    if results:
-        print(f"\n{'=' * 160}")
-        print(f"  PAIR PROFITABILITY ACROSS TOP 20 CONFIGS")
-        print(f"{'=' * 160}")
+        for rank_val, si, alloc in candidates:
+            if len(positions) >= current_top_n or si in held:
+                break
+            sym_sector = sector_lookup.get(si, 'OTHER')
+            if sector_counts[sym_sector] >= max_per_sector:
+                continue
+            ep = O[si, di + 1]
+            if np.isnan(ep) or ep <= 0:
+                continue
+            atr = compute_atr_at(H, L, C, si, di, start_di)
+            if atr is None:
+                continue
+            positions.append(
+                (si, di + 1, ep, ep - atr_stop * atr, alloc, False))
+            held.add(si)
+            sector_counts[sym_sector] += 1
 
-        pair_summary = {}
-        for r in results[:20]:
-            for p, ps in r['pair_stats'].items():
-                if p not in pair_summary:
-                    pair_summary[p] = {'n': 0, 'w': 0, 'pnl': 0.0}
-                pair_summary[p]['n'] += ps['n']
-                pair_summary[p]['w'] += ps['w']
-                pair_summary[p]['pnl'] += ps['pnl']
+    # Close remaining positions
+    for si, edi, ep, sp, alloc, is_pyr in positions:
+        c = C[si, ND - 1]
+        if not np.isnan(c) and c > 0:
+            pnl = (c - ep) / ep - COMM
+            equity += equity * alloc * pnl
 
-        for p in sorted(pair_summary.keys(), key=lambda x: -pair_summary[x]['pnl']):
-            ps = pair_summary[p]
-            wr_p = ps['w'] / max(ps['n'], 1) * 100
-            print(f"  {p:25s}: {ps['n']:5d} trades  WR={wr_p:5.1f}%  Total Abs={ps['pnl']:+12.0f}")
+    return trades, equity, max_dd
 
-    # ================================================================
-    # FEATURE CONTRIBUTION ANALYSIS
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  FEATURE CONTRIBUTION ANALYSIS")
-    print(f"{'=' * 160}")
 
-    # Compare each feature ON vs OFF (controlled: same base config)
-    features = [
-        ('Reentry', '_RE1_', '_RE0_'),
-        ('Z-Weight', '_ZW1_', '_ZW0_'),
-        ('Multi-Day', '_MD1_', '_MD0_'),
-        ('Adaptive-Z', '_AZ1_', '_AZ0_'),
+def analyze(trades: List[dict], equity: float, max_dd: float,
+            label: str = "") -> Optional[dict]:
+    if not trades:
+        print(f"  {label}: no trades")
+        return None
+
+    nw = sum(1 for t in trades if t["pnl_pct"] > 0)
+    wr = nw / len(trades) * 100
+    n_days = max(1, trades[-1]["di"] - trades[0]["di"])
+    ann = ((equity / CASH0) ** (1 / max(1.0, n_days / 252)) - 1) * 100
+    ap = [t["pnl_abs"] for t in sorted(trades, key=lambda x: x["di"])]
+    rets = np.array(ap) / CASH0
+    sh = (np.mean(rets) / np.std(rets) * np.sqrt(252)
+          if np.std(rets) > 0 else 0)
+
+    n_pyr = sum(1 for t in trades if t.get("pyr"))
+    n_base = len(trades) - n_pyr
+    n_stop = sum(1 for t in trades if t["reason"] == "stop")
+    n_hold = sum(1 for t in trades if t["reason"] == "hold")
+
+    mode_counts = {"WIN": 0, "NORM": 0, "LOSE": 0}
+    for t in trades:
+        m = t.get("mode", "NORM")
+        if m in mode_counts:
+            mode_counts[m] += 1
+
+    sector_counts: Dict[str, int] = defaultdict(int)
+    for t in trades:
+        sector_counts[t.get("sector", "OTHER")] += 1
+    sector_str = " ".join(
+        f"{k}:{v}" for k, v in sorted(sector_counts.items()))
+
+    print(
+        f"  {label}: {len(trades)}t (base:{n_base} pyr:{n_pyr} "
+        f"stop:{n_stop} hold:{n_hold}) "
+        f"WR={wr:.1f}% ann={ann:+.1f}% DD={max_dd:.1f}% "
+        f"Sh={sh:.2f} eq={equity:,.0f} "
+        f"modes=[W:{mode_counts['WIN']} N:{mode_counts['NORM']} "
+        f"L:{mode_counts['LOSE']}]"
+    )
+    print(f"    sectors: {sector_str}")
+
+    yr: Dict[int, dict] = {}
+    for t in trades:
+        y = t["year"]
+        if y not in yr:
+            yr[y] = {"n": 0, "w": 0, "pnl": []}
+        yr[y]["n"] += 1
+        if t["pnl_pct"] > 0:
+            yr[y]["w"] += 1
+        yr[y]["pnl"].append(t["pnl_pct"])
+    for y in sorted(yr.keys()):
+        ys = yr[y]
+        cum = np.prod([1 + p / 100 for p in ys["pnl"]]) - 1
+        print(
+            f"    {y}: {ys['n']}t WR={ys['w']/ys['n']*100:.1f}% "
+            f"cum={cum:+.1%}")
+
+    return {
+        "n": len(trades), "wr": wr, "dd": max_dd,
+        "ann": ann, "sh": sh, "eq": equity,
+    }
+
+
+def walk_forward(
+    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
+    NS: int, ND: int, dates: np.ndarray, syms: List[str],
+    sigs: Dict[str, np.ndarray],
+    sector_lookup: Dict[int, str],
+    win_threshold: float = 0.60,
+    normal_threshold: float = 0.82,
+    lose_threshold: float = 0.90,
+    win_rate_window: int = 15,
+    atr_stop: float = 3.0,
+    top_n_winning: int = 2,
+    max_per_sector: int = 1,
+    min_composite: float = 0.80,
+    ker_gate_losing: float = 0.10,
+    max_ad_ratio: float = 0.50,
+) -> List[dict]:
+    """Walk-forward validation: year-by-year out-of-sample."""
+    print(f"\n{'=' * 70}")
+    print(
+        f"  WALK-FORWARD V62 "
+        f"(wt={win_threshold:.2f} nt={normal_threshold:.2f} "
+        f"lt={lose_threshold:.2f} ww={win_rate_window} "
+        f"ats={atr_stop:.1f} tnw={top_n_winning} mps={max_per_sector} "
+        f"mc={min_composite:.2f} kgl={ker_gate_losing:.2f} "
+        f"mad={max_ad_ratio:.2f})"
+    )
+    print(f"{'=' * 70}")
+
+    years = sorted(set(d.year for d in dates))
+    all_trades: List[dict] = []
+
+    for test_year in range(2019, years[-1] + 1):
+        test_start = None
+        test_end_idx = None
+        for i, d in enumerate(dates):
+            if d.year == test_year and test_start is None:
+                test_start = i
+            if d.year == test_year:
+                test_end_idx = i
+        if test_start is None:
+            continue
+
+        trades, _, _ = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            win_threshold=win_threshold,
+            normal_threshold=normal_threshold,
+            lose_threshold=lose_threshold,
+            win_rate_window=win_rate_window,
+            atr_stop=atr_stop,
+            top_n_winning=top_n_winning,
+            max_per_sector=max_per_sector,
+            min_confidence=3,
+            hold_days=5,
+            pyramid_day=1,
+            start_di=test_start,
+            end_di=test_end_idx + 1,
+            min_composite=min_composite,
+            ker_gate_losing=ker_gate_losing,
+            max_ad_ratio=max_ad_ratio,
+        )
+
+        test_trades = [t for t in trades
+                       if dates[t["di"]].year == test_year]
+        all_trades.extend(test_trades)
+
+        if test_trades:
+            n = len(test_trades)
+            nw = sum(1 for t in test_trades if t["pnl_pct"] > 0)
+            wr_val = nw / n * 100
+            avg = np.mean([t["pnl_pct"] for t in test_trades])
+            modes = {"W": 0, "N": 0, "L": 0}
+            for t in test_trades:
+                m = t.get("mode", "NORM")
+                if m == "WIN":
+                    modes["W"] += 1
+                elif m == "LOSE":
+                    modes["L"] += 1
+                else:
+                    modes["N"] += 1
+            yr_sectors: Dict[str, int] = defaultdict(int)
+            for t in test_trades:
+                yr_sectors[t.get("sector", "OTHER")] += 1
+            sec_str = " ".join(
+                f"{k}:{v}" for k, v in sorted(yr_sectors.items()))
+            print(
+                f"  {test_year}: {n}t WR={wr_val:.1f}% avg={avg:+.2f}% "
+                f"modes=[W:{modes['W']} N:{modes['N']} L:{modes['L']}] "
+                f"sectors=[{sec_str}]",
+                flush=True,
+            )
+        else:
+            print(f"  {test_year}: no trades", flush=True)
+
+    if all_trades:
+        nw = sum(1 for t in all_trades if t["pnl_pct"] > 0)
+        wr_val = nw / len(all_trades) * 100
+        avg = np.mean([t["pnl_pct"] for t in all_trades])
+        cum = np.prod(
+            [1 + t["pnl_pct"] / 100 for t in all_trades]) - 1
+        n_pyr = sum(1 for t in all_trades if t.get("pyr"))
+        agg_sectors: Dict[str, int] = defaultdict(int)
+        for t in all_trades:
+            agg_sectors[t.get("sector", "OTHER")] += 1
+        sec_str = " ".join(
+            f"{k}:{v}" for k, v in sorted(agg_sectors.items()))
+        print(
+            f"\n  WF TOTAL: {len(all_trades)}t (pyr:{n_pyr}) "
+            f"WR={wr_val:.1f}% avg={avg:+.2f}% cum={cum:+.1%}"
+        )
+        print(f"  WF SECTORS: {sec_str}")
+        return all_trades
+    return []
+
+
+def main() -> None:
+    t0 = time.time()
+    print("=" * 70)
+    print("  V62: V47 SECTOR LIMIT + EXTREME QUALITY FILTER")
+    print("  Extreme rank + sector limit + KER gate + A/D oversold filter")
+    print("=" * 70)
+
+    C, O, H, L, V, OI, NS, ND, dates, syms = load_all_data(
+        start="2016-01-01")
+    print(
+        f"  {NS} sym, {ND} days, "
+        f"{dates[0].strftime('%Y-%m-%d')} to "
+        f"{dates[-1].strftime('%Y-%m-%d')}"
+    )
+
+    sector_lookup = build_sector_lookup(syms)
+    sector_dist: Dict[str, int] = defaultdict(int)
+    for sec in sector_lookup.values():
+        sector_dist[sec] += 1
+    print(f"  Sector distribution: {dict(sector_dist)}")
+
+    sigs = compute_all_signals(C, O, H, L, V, OI, NS, ND)
+
+    # Find 2019 start index for OOS testing
+    bt_2019 = None
+    for i, d in enumerate(dates):
+        if d >= pd.Timestamp("2019-01-01"):
+            bt_2019 = i
+            break
+
+    # === 1. Walk-Forward with default configs ===
+    print("\n" + "=" * 70)
+    print("  WALK-FORWARD VALIDATION (2019-2026) -- DEFAULT CONFIGS")
+    print("=" * 70)
+
+    default_configs = [
+        # (mc, mps, lt, ww, kgl, mad)
+        (0.80, 1, 0.90, 15, 0.10, 0.50),
+        (0.80, 1, 0.90, 15, 0.10, 0.55),
+        (0.80, 2, 0.90, 15, 0.10, 0.50),
+        (0.85, 1, 0.90, 15, 0.08, 0.50),
+        (0.80, 1, 0.92, 15, 0.10, 0.50),
     ]
 
-    for feat_name, on_tag, off_tag in features:
-        on_results = [r for r in results if on_tag in r['name']]
-        off_results = [r for r in results if off_tag in r['name']]
-        if on_results and off_results:
-            on_avg = np.mean([r['ann'] for r in on_results])
-            off_avg = np.mean([r['ann'] for r in off_results])
-            on_best = max(r['ann'] for r in on_results)
-            off_best = max(r['ann'] for r in off_results)
-            delta_avg = on_avg - off_avg
-            delta_best = on_best - off_best
-            print(f"  {feat_name:12s}: ON avg={on_avg:+7.1f}% (best={on_best:+7.1f}%)  "
-                  f"OFF avg={off_avg:+7.1f}% (best={off_best:+7.1f}%)  "
-                  f"Delta avg={delta_avg:+7.1f}%  Delta best={delta_best:+7.1f}%")
+    for mc, mps, lt, ww, kgl, mad in default_configs:
+        walk_forward(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            max_per_sector=mps,
+            lose_threshold=lt,
+            win_rate_window=ww,
+            min_composite=mc,
+            ker_gate_losing=kgl,
+            max_ad_ratio=mad,
+        )
 
-    # ================================================================
-    # FINAL SUMMARY
-    # ================================================================
-    print(f"\n{'=' * 160}")
-    print(f"  FINAL SUMMARY")
-    print(f"{'=' * 160}")
+    # === 2. Full 10-year backtest with profiles ===
+    print("\n" + "=" * 70)
+    print("  FULL 2016-2026 (10 years) -- PROFILE COMPARISON")
+    print("=" * 70)
 
+    profiles = [
+        (0.80, 1, 0.90, 15, 0.10, 0.50, "Default mc=0.80 mps=1"),
+        (0.80, 2, 0.90, 15, 0.10, 0.50, "Default mc=0.80 mps=2"),
+        (0.85, 1, 0.90, 15, 0.08, 0.50, "Strict mc=0.85 kgl=0.08"),
+        (0.75, 1, 0.88, 15, 0.10, 0.50, "Relaxed mc=0.75 lt=0.88"),
+        (0.85, 1, 0.92, 15, 0.08, 0.45, "Tight mc=0.85 kgl=0.08 mad=0.45"),
+        (0.80, 1, 0.90, 10, 0.10, 0.50, "Short window"),
+        (0.80, 1, 0.90, 20, 0.10, 0.50, "Long window"),
+    ]
+
+    for mc, mps, lt, ww, kgl, mad, label in profiles:
+        trades, eq, dd = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            max_per_sector=mps,
+            lose_threshold=lt,
+            win_rate_window=ww,
+            start_di=60,
+            min_composite=mc,
+            ker_gate_losing=kgl,
+            max_ad_ratio=mad,
+        )
+        print(f"\n  {label}")
+        analyze(trades, eq, dd, label)
+
+    # === 3. Parameter sweep ===
+    print("\n" + "=" * 70)
+    print("  PARAMETER SWEEP (2019-2026)")
+    print("=" * 70)
+
+    results: List[dict] = []
+
+    sweep_params = {
+        "min_composite": [0.75, 0.80, 0.85],
+        "max_per_sector": [1, 2],
+        "lose_threshold": [0.88, 0.90, 0.92],
+        "win_rate_window": [10, 15, 20],
+        "ker_gate_losing": [0.08, 0.10, 0.15],
+        "max_ad_ratio": [0.45, 0.50, 0.55],
+    }
+
+    total_combos = 1
+    for v in sweep_params.values():
+        total_combos *= len(v)
+    print(f"  Total combinations: {total_combos}")
+
+    combo_count = 0
+    for mc, mps, lt, ww, kgl, mad in product(
+        sweep_params["min_composite"],
+        sweep_params["max_per_sector"],
+        sweep_params["lose_threshold"],
+        sweep_params["win_rate_window"],
+        sweep_params["ker_gate_losing"],
+        sweep_params["max_ad_ratio"],
+    ):
+        # Skip invalid: lose threshold must be > normal threshold (0.82)
+        if lt <= 0.82:
+            continue
+
+        combo_count += 1
+        trades, eq, dd = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            lose_threshold=lt,
+            win_rate_window=ww,
+            atr_stop=3.0,
+            top_n_winning=2,
+            max_per_sector=mps,
+            start_di=bt_2019,
+            min_composite=mc,
+            ker_gate_losing=kgl,
+            max_ad_ratio=mad,
+        )
+
+        if len(trades) < 10:
+            continue
+
+        nw = sum(1 for t in trades if t["pnl_pct"] > 0)
+        wr = nw / len(trades) * 100
+        n_days = max(1, trades[-1]["di"] - trades[0]["di"])
+        ann = ((eq / CASH0) ** (1 / max(1.0, n_days / 252)) - 1) * 100
+        ap = [t["pnl_abs"] for t in sorted(trades, key=lambda x: x["di"])]
+        rets_arr = np.array(ap) / CASH0
+        sh_val = (np.mean(rets_arr) / np.std(rets_arr) * np.sqrt(252)
+                  if np.std(rets_arr) > 0 else 0)
+
+        yr_counts: Dict[int, int] = {}
+        for t in trades:
+            y = t["year"]
+            yr_counts[y] = yr_counts.get(y, 0) + 1
+        oos_years = [y for y in yr_counts if y >= 2019]
+        avg_per_year = (sum(yr_counts[y] for y in oos_years)
+                        / max(len(oos_years), 1))
+
+        sec_trades: Dict[str, int] = defaultdict(int)
+        for t in trades:
+            sec_trades[t.get("sector", "OTHER")] += 1
+        max_sec_pct = max(sec_trades.values()) / len(trades) * 100
+
+        results.append({
+            "mc": mc, "mps": mps, "lt": lt,
+            "ww": ww, "kgl": kgl, "mad": mad,
+            "n": len(trades), "wr": wr, "ann": ann,
+            "dd": dd, "sharpe": sh_val, "eq": eq,
+            "avg_yr": avg_per_year, "max_sec": max_sec_pct,
+        })
+
+    results.sort(key=lambda x: -x["sharpe"])
+    print(
+        f"\n  Evaluated {combo_count} combos, "
+        f"{len(results)} with 10+ trades"
+    )
+    print(
+        f"\n{'MC':>4} {'MPS':>3} {'LT':>4} {'WW':>3} "
+        f"{'KGL':>4} {'MAD':>4} "
+        f"{'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} "
+        f"{'Sh':>6} {'Avg/Yr':>7} {'MaxSec':>7}"
+    )
+    print("-" * 95)
+    for r in results[:30]:
+        print(
+            f"{r['mc']:>4.2f} {r['mps']:>3} {r['lt']:>4.2f} "
+            f"{r['ww']:>3} {r['kgl']:>4.2f} {r['mad']:>4.2f} "
+            f"{r['n']:>5} {r['wr']:>5.1f} {r['ann']:>+8.1f} "
+            f"{r['dd']:>6.1f} {r['sharpe']:>6.2f} {r['avg_yr']:>7.1f} "
+            f"{r['max_sec']:>6.1f}%"
+        )
+
+    # === 4. Top configs: full 10-year backtest ===
+    print("\n" + "=" * 70)
+    print("  TOP CONFIGS -- FULL 10-YEAR (2016-2026)")
+    print("=" * 70)
+
+    for r in results[:5]:
+        trades, eq, dd = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            lose_threshold=r["lt"],
+            win_rate_window=r["ww"],
+            atr_stop=3.0,
+            top_n_winning=2,
+            max_per_sector=r["mps"],
+            start_di=60,
+            min_composite=r["mc"],
+            ker_gate_losing=r["kgl"],
+            max_ad_ratio=r["mad"],
+        )
+        label = (
+            f"mc={r['mc']:.2f} mps={r['mps']} lt={r['lt']:.2f} "
+            f"ww={r['ww']} kgl={r['kgl']:.2f} mad={r['mad']:.2f}"
+        )
+        print(f"\n  FULL {label}")
+        analyze(trades, eq, dd, label)
+
+    # === 5. Walk-forward for best config ===
     if results:
-        print(f"\n  Full-period best: {results[0]['name']}")
-        print(f"    Ann={results[0]['ann']:+.1f}%  WR={results[0]['wr']:.1f}%  N={results[0]['n']}  "
-              f"DD={results[0]['dd']:.1f}%  PF={results[0]['pf']:.2f}  Sharpe={results[0]['sharpe']:.2f}")
+        best = results[0]
+        print("\n" + "=" * 70)
+        print(
+            f"  BEST WF: mc={best['mc']:.2f} mps={best['mps']} "
+            f"lt={best['lt']:.2f} ww={best['ww']} "
+            f"kgl={best['kgl']:.2f} mad={best['mad']:.2f}"
+        )
+        print("=" * 70)
+        walk_forward(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            lose_threshold=best["lt"],
+            win_rate_window=best["ww"],
+            atr_stop=3.0,
+            top_n_winning=2,
+            max_per_sector=best["mps"],
+            min_composite=best["mc"],
+            ker_gate_losing=best["kgl"],
+            max_ad_ratio=best["mad"],
+        )
 
-    if wf_avg:
-        print(f"\n  Walk-forward best: {wf_avg[0]['name']}")
-        print(f"    WF Avg Ann={wf_avg[0]['avg_ann']:+.1f}%  WF Med Ann={wf_avg[0]['med_ann']:+.1f}%  "
-              f"Min={wf_avg[0]['min_ann']:+.1f}%  Max={wf_avg[0]['max_ann']:+.1f}%  "
-              f"Pos/Win={wf_avg[0]['n_positive']}/{wf_avg[0]['n_windows']}")
+        # === 6. Compare: V62 vs V47 baseline ===
+        print("\n" + "=" * 70)
+        print("  COMPARISON: V62 (extreme quality) vs V47 (sector only)")
+        print("  (2019-2026 OOS)")
+        print("=" * 70)
 
-        n_all_positive = sum(1 for w in wf_avg if w['n_positive'] == w['n_windows'])
-        print(f"\n  Of top 5 WF configs, {n_all_positive} are positive in ALL test windows")
+        # V62 with best config
+        trades_v62, eq_v62, dd_v62 = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            lose_threshold=best["lt"],
+            win_rate_window=best["ww"],
+            atr_stop=3.0,
+            top_n_winning=2,
+            max_per_sector=best["mps"],
+            start_di=bt_2019,
+            min_composite=best["mc"],
+            ker_gate_losing=best["kgl"],
+            max_ad_ratio=best["mad"],
+        )
 
-    # Comparison to baselines
-    print(f"\n  Baseline comparison:")
-    print(f"    V61 champion:         +324.3% (LOG-biased adaptive, EP40, Z=0.8, MP1, 14 pairs)")
-    if results:
-        print(f"    V62 best full-period: {results[0]['ann']:+.1f}%")
-    if wf_avg:
-        print(f"    V62 best WF avg:      {wf_avg[0]['avg_ann']:+.1f}%")
-        print(f"    V62 best WF min:      {wf_avg[0]['min_ann']:+.1f}% (worst single window)")
-        print(f"    V62 best WF max:      {wf_avg[0]['max_ann']:+.1f}% (best single window)")
+        # V47-like: no extreme quality filters (mc=0, kgl=1.0, mad=1.0)
+        trades_v47like, eq_v47like, dd_v47like = backtest_v62(
+            C, O, H, L, NS, ND, dates, syms, sigs,
+            sector_lookup=sector_lookup,
+            lose_threshold=best["lt"],
+            win_rate_window=best["ww"],
+            atr_stop=3.0,
+            top_n_winning=2,
+            max_per_sector=best["mps"],
+            start_di=bt_2019,
+            min_composite=0.0,    # no minimum composite floor
+            ker_gate_losing=1.0,  # no KER gate in losing mode
+            max_ad_ratio=1.0,     # no A/D ratio filter
+        )
 
-    elapsed = time.time() - t_start
-    print(f"\n  Total time: {elapsed:.1f}s")
-    print("=" * 160)
+        print(f"\n  V62 WITH EXTREME QUALITY FILTER:")
+        analyze(trades_v62, eq_v62, dd_v62, "V62-extreme")
+        print(f"\n  V47-LIKE (NO EXTREME FILTERS):")
+        analyze(trades_v47like, eq_v47like, dd_v47like, "V47-base")
+
+        if trades_v62 and trades_v47like:
+            print(
+                f"\n  V62 vs V47: "
+                f"eq_delta={eq_v62 - eq_v47like:+,.0f} "
+                f"dd_delta={dd_v62 - dd_v47like:+.1f}% "
+                f"trade_delta={len(trades_v62) - len(trades_v47like):+d}"
+            )
+
+    print(f"\n[V62] Done. {time.time() - t0:.1f}s")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
