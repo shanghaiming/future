@@ -510,30 +510,33 @@ def compute_kelly_multiplier(
     """Amplifier 2: Drawdown circuit breaker + Kelly sizing.
 
     Returns (kelly_mult, should_trade).
+    Note: Based on research, circuit breakers destroy returns.
+    Only use position sizing for DD control, NOT stopping entirely.
     """
     if peak <= 0:
-        return 0.25, True
+        return 1.0, True
     dd_pct = (peak - equity) / peak * 100
-    if dd_pct > 25:
-        return 0.0, False  # Stop trading entirely
-    if dd_pct > 15:
-        return 0.25, True
-    if dd_pct > 5:
+    if dd_pct > 30:
+        return 0.30, True  # Reduce but don't stop (research: stopping kills returns)
+    if dd_pct > 20:
         return 0.50, True
-    return 0.75, True  # Aggressive 3/4 Kelly when DD < 5%
+    if dd_pct > 10:
+        return 0.75, True
+    return 1.0, True  # Full size when DD < 10%
 
 
 def compute_sector_leader_signal(
     composite: np.ndarray,
     sector_lookup: Dict[int, str],
     NS: int, ND: int,
-    threshold: float = 0.60,
+    threshold: float = 0.55,
 ) -> np.ndarray:
     """Amplifier 5: Cross-asset confirmation.
 
-    For each sector, find the leader (highest composite rank).
-    Only allow trades when sector leader's composite > threshold.
-    Returns bool array: True = sector leader confirms MR signal.
+    For each sector, compute the median composite rank.
+    Only allow trades when the sector's median MR signal > threshold.
+    This filters idiosyncratic noise — only trade when the SECTOR
+    as a whole is mean-reverting.
     """
     confirm = np.zeros((NS, ND), dtype=bool)
 
@@ -543,14 +546,18 @@ def compute_sector_leader_signal(
 
     for di in range(ND):
         for sector, sis in sector_to_sis.items():
-            best_rank = -np.inf
+            ranks_in_sector = []
             for si in sis:
                 r = composite[si, di]
-                if not np.isnan(r) and r > best_rank:
-                    best_rank = r
-            leader_ok = best_rank >= threshold
+                if not np.isnan(r):
+                    ranks_in_sector.append(r)
+            if len(ranks_in_sector) >= 3:
+                median_rank = np.median(ranks_in_sector)
+                sector_ok = median_rank >= threshold
+            else:
+                sector_ok = True  # Don't gate small sectors
             for si in sis:
-                confirm[si, di] = leader_ok
+                confirm[si, di] = sector_ok
 
     return confirm
 
@@ -683,34 +690,9 @@ def backtest_v91(
         new_positions: List[Tuple[int, int, float, float, float, bool, float]] = []
 
         # --- Amplifier 2: Kelly/DD circuit breaker ---
-        kelly_mult, should_trade = compute_kelly_multiplier(equity, peak)
-        if not should_trade and enable_kelly:
-            # Close all positions immediately
-            for si, edi, ep, sp, alloc, is_pyr, ba in positions:
-                c = C[si, di]
-                if np.isnan(c):
-                    new_positions.append((si, edi, ep, sp, alloc, is_pyr, ba))
-                    continue
-                pnl = (c - ep) / ep - COMM
-                profit = equity * alloc * pnl
-                daily_pnl += profit
-                trades.append({
-                    "pnl_abs": profit, "pnl_pct": pnl * 100,
-                    "days": di - edi + 1, "di": di,
-                    "year": d.year, "sym": syms[si],
-                    "sector": sector_lookup.get(si, 'OTHER'),
-                    "reason": "circuit_breaker", "pyr": is_pyr,
-                    "amp": "kelly_stop",
-                })
-            positions = new_positions
-            equity += daily_pnl
-            if equity > peak:
-                peak = equity
-            if peak > 0:
-                dd = (peak - equity) / peak * 100
-                if dd > max_dd:
-                    max_dd = dd
-            continue
+        # Note: research shows stopping trading destroys returns.
+        # Kelly multiplier only affects pyramid sizing, not base positions.
+        kelly_mult, _ = compute_kelly_multiplier(equity, peak)
 
         # Group positions by symbol
         pos_by_si: Dict[int, List] = defaultdict(list)
@@ -779,8 +761,6 @@ def backtest_v91(
 
         if len(positions) >= max_positions:
             continue
-        if not should_trade and enable_kelly:
-            continue
 
         candidates = []
         for si in range(NS):
@@ -839,17 +819,12 @@ def backtest_v91(
             continue
         base_alloc = LEVERAGE / num_total
 
-        # Apply Kelly multiplier
-        if enable_kelly:
-            effective_alloc = base_alloc * kelly_mult
-        else:
-            effective_alloc = base_alloc
-
         # Update existing positions with new allocation
+        # Kelly does NOT reduce base alloc — only affects pyramid adds
         updated_positions = []
         for si, edi, ep, sp, _, is_pyr, orig_ba in positions:
             updated_positions.append(
-                (si, edi, ep, sp, effective_alloc, is_pyr, base_alloc))
+                (si, edi, ep, sp, base_alloc, is_pyr, base_alloc))
 
         # Enter new positions at open[di+1] with vol-regime sizing
         for rank_val, si, sym_sector in new_entries:
@@ -860,16 +835,18 @@ def backtest_v91(
             if atr is None:
                 continue
 
-            # Amplifier 1: Vol-regime multiplier
+            # Amplifier 1: Vol-regime multiplier on position sizing
+            # Low vol = can go slightly bigger, high vol = smaller
             if enable_vol_sizing:
                 vm = vol_mult[si, di + 1]
                 if np.isnan(vm):
                     vm = vol_mult[si, di]
                 if np.isnan(vm):
                     vm = 1.0
-                pos_alloc = effective_alloc * vm
+                # Clamp to prevent extreme positions
+                pos_alloc = min(base_alloc * vm, LEVERAGE * 0.30)
             else:
-                pos_alloc = effective_alloc
+                pos_alloc = base_alloc
 
             updated_positions.append(
                 (si, di + 1, ep, ep - atr_stop * atr,
@@ -877,9 +854,11 @@ def backtest_v91(
 
         positions = updated_positions
 
-        # --- Amplifier 3: Winner pyramiding ---
+        # --- Amplifier 3: Winner pyramiding (Kelly-gated) ---
         if enable_pyramiding:
             pyramid_positions = []
+            total_exposure = sum(alloc for _, _, _, _, alloc, _, _ in positions)
+
             for si, edi, ep, sp, alloc, is_pyr, ba in positions:
                 if is_pyr or si in held_has_pyramid:
                     pyramid_positions.append(
@@ -900,16 +879,32 @@ def backtest_v91(
                     continue
 
                 pnl_pct = (c - ep) / ep
-                if pnl_pct > 0 and composite[si, di] > pyramid_rank_threshold:
-                    # Add pyramid position — 50% of base allocation
-                    pyramid_alloc = ba * pyramid_add_fraction
-                    pyramid_positions.append(
-                        (si, edi, ep, sp, alloc, True, ba))
-                    pyramid_positions.append(
-                        (si, di, c, c - atr_stop * (
-                            compute_atr_at(H, L, C, si, di, start_di)
-                            or (c * 0.02)),
-                         pyramid_alloc, True, ba))
+                # Kelly gates pyramid: only add when DD is low
+                kelly_ok = (not enable_kelly) or kelly_mult >= 0.75
+                if (pnl_pct > 0
+                        and composite[si, di] > pyramid_rank_threshold
+                        and kelly_ok):
+                    # Add pyramid position — fraction of base, capped by total exposure
+                    pyramid_alloc = ba * pyramid_add_fraction * kelly_mult
+                    new_exposure = total_exposure + pyramid_alloc
+                    # Cap total portfolio exposure at leverage
+                    if new_exposure > LEVERAGE:
+                        pyramid_alloc = max(
+                            0, LEVERAGE - total_exposure)
+                    if pyramid_alloc > 0.001:
+                        pyramid_positions.append(
+                            (si, edi, ep, sp, alloc, True, ba))
+                        atr_val = compute_atr_at(
+                            H, L, C, si, di, start_di)
+                        stop_price = c - atr_stop * (
+                            atr_val if atr_val else c * 0.02)
+                        pyramid_positions.append(
+                            (si, di, c, stop_price,
+                             pyramid_alloc, True, ba))
+                        total_exposure += pyramid_alloc
+                    else:
+                        pyramid_positions.append(
+                            (si, edi, ep, sp, alloc, is_pyr, ba))
                 else:
                     pyramid_positions.append(
                         (si, edi, ep, sp, alloc, is_pyr, ba))
