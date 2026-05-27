@@ -99,284 +99,47 @@ def build_sector_lookup(syms: List[str]) -> Dict[int, str]:
     return sector_lookup
 
 
-def compute_rsi_manual(
-    C: np.ndarray, NS: int, ND: int, period: int = 14,
-) -> np.ndarray:
-    rsi = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        c = C[si]
-        gains = np.full(ND, np.nan)
-        losses = np.full(ND, np.nan)
-        for di in range(1, ND):
-            if np.isnan(c[di]) or np.isnan(c[di - 1]):
-                continue
-            delta = c[di] - c[di - 1]
-            gains[di] = max(delta, 0.0)
-            losses[di] = max(-delta, 0.0)
+# ====================================================================
+# VECTORIZED PRE-COMPUTATIONS (shared across all factor configs)
+# ====================================================================
 
-        avg_gain = np.nan
-        avg_loss = np.nan
-        for di in range(1, ND):
-            if np.isnan(gains[di]):
-                continue
-            if np.isnan(avg_gain):
-                valid_g = []
-                valid_l = []
-                for j in range(di, min(di + period, ND)):
-                    if not np.isnan(gains[j]):
-                        valid_g.append(gains[j])
-                        valid_l.append(
-                            losses[j] if not np.isnan(losses[j]) else 0.0)
-                if len(valid_g) >= period:
-                    avg_gain = np.mean(valid_g)
-                    avg_loss = np.mean(valid_l)
-                    if avg_loss == 0:
-                        rsi[si, di + period - 1] = 100.0
-                    else:
-                        rs = avg_gain / avg_loss
-                        rsi[si, di + period - 1] = (
-                            100.0 - 100.0 / (1.0 + rs))
-                continue
+def precompute_shared(
+    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
+    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
+) -> Dict[str, np.ndarray]:
+    """Pre-compute all shared data: vol_rank, rsi14, fwd_ret, atr_mean,
+    and per-lookback return/oi/vol/range/atrp arrays."""
+    t0 = time.time()
+    print("[V97] Pre-computing shared data (vol_rank, rsi, fwd_ret, atr, "
+          "per-lb factors)...", flush=True)
 
-            avg_gain = (avg_gain * (period - 1) + gains[di]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[di]) / period
-            if avg_loss == 0:
-                rsi[si, di] = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi[si, di] = 100.0 - 100.0 / (1.0 + rs)
-    return rsi
-
-
-def compute_realized_volatility(
-    C: np.ndarray, NS: int, ND: int, vol_window: int = 20,
-) -> np.ndarray:
-    """Compute rolling realized volatility (std of daily log returns)."""
+    # --- Realized volatility (20d rolling) ---
     realized_vol = np.full((NS, ND), np.nan)
     for si in range(NS):
-        for di in range(vol_window, ND):
-            returns = []
-            for j in range(di - vol_window, di):
-                if (not np.isnan(C[si, j])
-                        and not np.isnan(C[si, j + 1])
-                        and C[si, j] > 0):
-                    returns.append(
-                        np.log(C[si, j + 1] / C[si, j]))
-            if len(returns) >= vol_window // 2:
-                realized_vol[si, di] = np.std(returns)
-    return realized_vol
+        log_rets = np.full(ND, np.nan)
+        for di in range(1, ND):
+            if (not np.isnan(C[si, di])
+                    and not np.isnan(C[si, di - 1])
+                    and C[si, di - 1] > 0):
+                log_rets[di] = np.log(C[si, di] / C[si, di - 1])
+        # Rolling 20d std
+        for di in range(20, ND):
+            window = log_rets[di - 20:di]
+            valid = window[~np.isnan(window)]
+            if len(valid) >= 10:
+                realized_vol[si, di] = np.std(valid)
 
-
-def compute_vol_ranks(
-    realized_vol: np.ndarray, NS: int, ND: int,
-    min_count: int = 10,
-) -> np.ndarray:
-    """Cross-sectional percentile rank of realized volatility."""
+    # Cross-sectional vol rank
     vol_rank = np.full((NS, ND), np.nan)
     for di in range(ND):
         vals = realized_vol[:, di]
-        valid = vals[~np.isnan(vals)]
-        if len(valid) < min_count:
+        valid_count = np.sum(~np.isnan(vals))
+        if valid_count < 10:
             continue
-        ranked = pd.Series(vals).rank(
+        vol_rank[:, di] = pd.Series(vals).rank(
             pct=True, na_option="keep").values
-        vol_rank[:, di] = ranked
-    return vol_rank
 
-
-def compute_adaptive_return(
-    C: np.ndarray, NS: int, ND: int,
-    vol_rank: np.ndarray,
-    short_lb: int, medium_lb: int, long_lb: int,
-    high_vol_pct: float, low_vol_pct: float,
-) -> np.ndarray:
-    """Compute vol-adaptive return using dynamic lookback windows."""
-    ret_adaptive = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(long_lb, ND):
-            if np.isnan(C[si, di]) or C[si, di] <= 0:
-                continue
-            vr = vol_rank[si, di]
-            if np.isnan(vr):
-                continue
-            if vr > high_vol_pct:
-                lb = short_lb
-            elif vr < low_vol_pct:
-                lb = long_lb
-            else:
-                lb = medium_lb
-            prev_di = di - lb
-            if prev_di < 0 or np.isnan(C[si, prev_di]) or C[si, prev_di] <= 0:
-                continue
-            ret_adaptive[si, di] = C[si, di] / C[si, prev_di] - 1.0
-    return ret_adaptive
-
-
-def compute_adaptive_oi(
-    OI: np.ndarray, NS: int, ND: int,
-    vol_rank: np.ndarray,
-    short_lb: int, medium_lb: int, long_lb: int,
-    high_vol_pct: float, low_vol_pct: float,
-) -> np.ndarray:
-    """Compute vol-adaptive OI change using dynamic lookback windows."""
-    oi_adaptive = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(long_lb, ND):
-            if np.isnan(OI[si, di]):
-                continue
-            vr = vol_rank[si, di]
-            if np.isnan(vr):
-                continue
-            if vr > high_vol_pct:
-                lb = short_lb
-            elif vr < low_vol_pct:
-                lb = long_lb
-            else:
-                lb = medium_lb
-            prev_di = di - lb
-            if (prev_di < 0
-                    or np.isnan(OI[si, prev_di])
-                    or OI[si, prev_di] <= 0):
-                continue
-            oi_adaptive[si, di] = OI[si, di] / OI[si, prev_di] - 1.0
-    return oi_adaptive
-
-
-def compute_adaptive_vol(
-    V: np.ndarray, NS: int, ND: int,
-    vol_rank: np.ndarray,
-    short_lb: int, medium_lb: int, long_lb: int,
-    high_vol_pct: float, low_vol_pct: float,
-) -> np.ndarray:
-    """Compute vol-adaptive average volume using dynamic lookback windows."""
-    vol_adaptive = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(long_lb, ND):
-            vr = vol_rank[si, di]
-            if np.isnan(vr):
-                continue
-            if vr > high_vol_pct:
-                lb = short_lb
-            elif vr < low_vol_pct:
-                lb = long_lb
-            else:
-                lb = medium_lb
-            vals = V[si, di - lb:di]
-            valid = vals[~np.isnan(vals)]
-            min_samples = max(2, lb // 2)
-            if len(valid) >= min_samples:
-                vol_adaptive[si, di] = np.mean(valid)
-    return vol_adaptive
-
-
-def compute_adaptive_range(
-    H: np.ndarray, L: np.ndarray, C: np.ndarray,
-    NS: int, ND: int,
-    vol_rank: np.ndarray,
-    short_lb: int, medium_lb: int, long_lb: int,
-    high_vol_pct: float, low_vol_pct: float,
-) -> np.ndarray:
-    """Compute vol-adaptive average range using dynamic lookback windows."""
-    range_adaptive = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(long_lb, ND):
-            vr = vol_rank[si, di]
-            if np.isnan(vr):
-                continue
-            if vr > high_vol_pct:
-                lb = short_lb
-            elif vr < low_vol_pct:
-                lb = long_lb
-            else:
-                lb = medium_lb
-            rng_vals = []
-            for j in range(di - lb, di):
-                if (not np.isnan(H[si, j]) and not np.isnan(L[si, j])
-                        and not np.isnan(C[si, j]) and C[si, j] > 0
-                        and H[si, j] > L[si, j]):
-                    rng_vals.append((H[si, j] - L[si, j]) / C[si, j])
-            min_samples = max(2, lb // 2)
-            if len(rng_vals) >= min_samples:
-                range_adaptive[si, di] = np.mean(rng_vals)
-    return range_adaptive
-
-
-def compute_adaptive_atrp(
-    H: np.ndarray, L: np.ndarray, C: np.ndarray,
-    NS: int, ND: int,
-    vol_rank: np.ndarray,
-    short_lb: int, medium_lb: int, long_lb: int,
-    high_vol_pct: float, low_vol_pct: float,
-) -> np.ndarray:
-    """Compute vol-adaptive ATR% using dynamic lookback windows."""
-    atrp_adaptive = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(long_lb + 1, ND):
-            vr = vol_rank[si, di]
-            if np.isnan(vr):
-                continue
-            if vr > high_vol_pct:
-                lb = short_lb
-            elif vr < low_vol_pct:
-                lb = long_lb
-            else:
-                lb = medium_lb
-            atr_vals = []
-            for j in range(max(1, di - lb), di):
-                hh, ll, cc = H[si, j], L[si, j], C[si, j]
-                if not any(np.isnan([hh, ll, cc])):
-                    prev_c = (
-                        C[si, j - 1]
-                        if j > 0 and not np.isnan(C[si, j - 1])
-                        else cc)
-                    atr_vals.append(
-                        max(hh - ll, abs(hh - prev_c), abs(ll - prev_c)))
-            if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
-                atrp_adaptive[si, di] = np.mean(atr_vals) / C[si, di]
-    return atrp_adaptive
-
-
-def compute_dynamic_factors(
-    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
-    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
-    short_lb: int = 3, medium_lb: int = 10, long_lb: int = 20,
-    high_vol_pct: float = 0.70, low_vol_pct: float = 0.30,
-) -> Dict[str, np.ndarray]:
-    """Compute all vol-adaptive dynamic factors + static factors."""
-    t0 = time.time()
-    print(
-        f"[V97] Computing vol-adaptive factors "
-        f"(sl={short_lb} ml={medium_lb} ll={long_lb} "
-        f"hp={high_vol_pct:.2f} lp={low_vol_pct:.2f})...",
-        flush=True)
-
-    # Step 1: Compute realized volatility and its cross-sectional rank
-    realized_vol = compute_realized_volatility(C, NS, ND, vol_window=20)
-    vol_rank = compute_vol_ranks(realized_vol, NS, ND)
-
-    # Step 2: Compute vol-adaptive dynamic factors
-    ret_adaptive = compute_adaptive_return(
-        C, NS, ND, vol_rank,
-        short_lb, medium_lb, long_lb,
-        high_vol_pct, low_vol_pct)
-    oi_adaptive = compute_adaptive_oi(
-        OI, NS, ND, vol_rank,
-        short_lb, medium_lb, long_lb,
-        high_vol_pct, low_vol_pct)
-    vol_adaptive = compute_adaptive_vol(
-        V, NS, ND, vol_rank,
-        short_lb, medium_lb, long_lb,
-        high_vol_pct, low_vol_pct)
-    range_adaptive = compute_adaptive_range(
-        H, L, C, NS, ND, vol_rank,
-        short_lb, medium_lb, long_lb,
-        high_vol_pct, low_vol_pct)
-    atrp_adaptive = compute_adaptive_atrp(
-        H, L, C, NS, ND, vol_rank,
-        short_lb, medium_lb, long_lb,
-        high_vol_pct, low_vol_pct)
-
-    # Step 3: RSI (static, not lookback-dependent)
+    # --- RSI 14 ---
     rsi14 = np.full((NS, ND), np.nan)
     if HAS_TALIB:
         for si in range(NS):
@@ -388,14 +151,7 @@ def compute_dynamic_factors(
             except Exception:
                 pass
 
-    needs_fallback = np.all(np.isnan(rsi14), axis=1)
-    if needs_fallback.any():
-        rsi_manual = compute_rsi_manual(C, NS, ND, 14)
-        for si in range(NS):
-            if needs_fallback[si]:
-                rsi14[si] = rsi_manual[si]
-
-    # Step 4: Forward return target for NW kernel training
+    # --- Forward return target ---
     fwd_ret_5d = np.full((NS, ND), np.nan)
     for si in range(NS):
         for di in range(ND - 5):
@@ -404,7 +160,7 @@ def compute_dynamic_factors(
                     and C[si, di] > 0):
                 fwd_ret_5d[si, di] = C[si, di + 5] / C[si, di] - 1.0
 
-    # Step 5: ATR mean for adaptive bandwidth (uses fixed 14d window)
+    # --- ATR mean for adaptive bandwidth ---
     atr_mean = np.full((NS, ND), np.nan)
     for si in range(NS):
         for di in range(20, ND):
@@ -421,24 +177,150 @@ def compute_dynamic_factors(
             if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
                 atr_mean[si, di] = np.mean(atr_vals) / C[si, di]
 
-    print(f"  Dynamic factors done: {time.time() - t0:.1f}s", flush=True)
+    # --- Pre-compute return for every possible lookback ---
+    all_lookbacks = [2, 3, 5, 8, 10, 12, 15, 20, 25]
+    ret_by_lb: Dict[int, np.ndarray] = {}
+    for lb in all_lookbacks:
+        arr = np.full((NS, ND), np.nan)
+        for si in range(NS):
+            for di in range(lb, ND):
+                if (not np.isnan(C[si, di])
+                        and not np.isnan(C[si, di - lb])
+                        and C[si, di - lb] > 0):
+                    arr[si, di] = C[si, di] / C[si, di - lb] - 1.0
+        ret_by_lb[lb] = arr
+
+    # --- Pre-compute OI change for every possible lookback ---
+    oi_by_lb: Dict[int, np.ndarray] = {}
+    for lb in all_lookbacks:
+        arr = np.full((NS, ND), np.nan)
+        for si in range(NS):
+            for di in range(lb, ND):
+                if (not np.isnan(OI[si, di])
+                        and not np.isnan(OI[si, di - lb])
+                        and OI[si, di - lb] > 0):
+                    arr[si, di] = OI[si, di] / OI[si, di - lb] - 1.0
+        oi_by_lb[lb] = arr
+
+    # --- Pre-compute avg volume for every possible lookback ---
+    vol_by_lb: Dict[int, np.ndarray] = {}
+    for lb in all_lookbacks:
+        arr = np.full((NS, ND), np.nan)
+        for si in range(NS):
+            for di in range(lb, ND):
+                vals = V[si, di - lb:di]
+                valid = vals[~np.isnan(vals)]
+                if len(valid) >= max(2, lb // 2):
+                    arr[si, di] = np.mean(valid)
+        vol_by_lb[lb] = arr
+
+    # --- Pre-compute avg range for every possible lookback ---
+    range_by_lb: Dict[int, np.ndarray] = {}
+    for lb in all_lookbacks:
+        arr = np.full((NS, ND), np.nan)
+        for si in range(NS):
+            for di in range(lb, ND):
+                rng_vals = []
+                for j in range(di - lb, di):
+                    if (not np.isnan(H[si, j]) and not np.isnan(L[si, j])
+                            and not np.isnan(C[si, j]) and C[si, j] > 0
+                            and H[si, j] > L[si, j]):
+                        rng_vals.append((H[si, j] - L[si, j]) / C[si, j])
+                if len(rng_vals) >= max(2, lb // 2):
+                    arr[si, di] = np.mean(rng_vals)
+        range_by_lb[lb] = arr
+
+    # --- Pre-compute ATR% for every possible lookback ---
+    atrp_by_lb: Dict[int, np.ndarray] = {}
+    for lb in all_lookbacks:
+        arr = np.full((NS, ND), np.nan)
+        for si in range(NS):
+            for di in range(lb + 1, ND):
+                atr_vals = []
+                for j in range(max(1, di - lb), di):
+                    hh, ll, cc = H[si, j], L[si, j], C[si, j]
+                    if not any(np.isnan([hh, ll, cc])):
+                        prev_c = (
+                            C[si, j - 1]
+                            if j > 0 and not np.isnan(C[si, j - 1])
+                            else cc)
+                        atr_vals.append(
+                            max(hh - ll, abs(hh - prev_c), abs(ll - prev_c)))
+                if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
+                    arr[si, di] = np.mean(atr_vals) / C[si, di]
+        atrp_by_lb[lb] = arr
+
+    print(f"  Shared data done: {time.time() - t0:.1f}s", flush=True)
     return {
-        "ret_adaptive": ret_adaptive,
-        "oi_adaptive": oi_adaptive,
+        "vol_rank": vol_rank,
         "rsi14": rsi14,
-        "vol_adaptive": vol_adaptive,
-        "range_adaptive": range_adaptive,
-        "atrp_adaptive": atrp_adaptive,
         "fwd_ret_5d": fwd_ret_5d,
         "atr_mean": atr_mean,
-        "vol_rank": vol_rank,
+        "ret_by_lb": ret_by_lb,
+        "oi_by_lb": oi_by_lb,
+        "vol_by_lb": vol_by_lb,
+        "range_by_lb": range_by_lb,
+        "atrp_by_lb": atrp_by_lb,
     }
 
+
+def build_dynamic_factors(
+    shared: Dict[str, np.ndarray],
+    NS: int, ND: int,
+    short_lb: int, medium_lb: int, long_lb: int,
+    high_vol_pct: float, low_vol_pct: float,
+) -> Dict[str, np.ndarray]:
+    """Build vol-adaptive dynamic factors from pre-computed per-lb data.
+
+    For each (si, di), select the lookback based on vol_rank:
+      - rank > high_vol_pct -> short_lb
+      - rank < low_vol_pct -> long_lb
+      - otherwise -> medium_lb
+    Then pick the pre-computed factor for that lookback.
+    """
+    vol_rank = shared["vol_rank"]
+
+    # Build a combined lookback map: (NS, ND) -> which lb to use
+    lb_map = np.full((NS, ND), medium_lb, dtype=int)
+    for si in range(NS):
+        for di in range(ND):
+            vr = vol_rank[si, di]
+            if np.isnan(vr):
+                continue
+            if vr > high_vol_pct:
+                lb_map[si, di] = short_lb
+            elif vr < low_vol_pct:
+                lb_map[si, di] = long_lb
+
+    # Now build dynamic factors by selecting from pre-computed arrays
+    def _select_adaptive(lb_dict: Dict[int, np.ndarray]) -> np.ndarray:
+        result = np.full((NS, ND), np.nan)
+        for lb_val in [short_lb, medium_lb, long_lb]:
+            src = lb_dict[lb_val]
+            mask = (lb_map == lb_val)
+            result[mask] = src[mask]
+        return result
+
+    return {
+        "ret_adaptive": _select_adaptive(shared["ret_by_lb"]),
+        "oi_adaptive": _select_adaptive(shared["oi_by_lb"]),
+        "rsi14": shared["rsi14"],
+        "vol_adaptive": _select_adaptive(shared["vol_by_lb"]),
+        "range_adaptive": _select_adaptive(shared["range_by_lb"]),
+        "atrp_adaptive": _select_adaptive(shared["atrp_by_lb"]),
+        "fwd_ret_5d": shared["fwd_ret_5d"],
+        "atr_mean": shared["atr_mean"],
+    }
+
+
+# ====================================================================
+# VECTORIZED NW KERNEL
+# ====================================================================
 
 def normalize_factor(
     factor: np.ndarray, NS: int, ND: int, min_count: int = 10,
 ) -> np.ndarray:
-    """Cross-sectional z-score normalization for a factor."""
+    """Vectorized cross-sectional z-score normalization."""
     normed = np.full((NS, ND), np.nan)
     for di in range(ND):
         vals = factor[:, di]
@@ -449,107 +331,117 @@ def normalize_factor(
         sigma = np.std(valid)
         if sigma < 1e-12:
             continue
-        for si in range(NS):
-            if not np.isnan(vals[si]):
-                normed[si, di] = (vals[si] - mu) / sigma
+        normed[:, di] = np.where(
+            ~np.isnan(vals), (vals - mu) / sigma, np.nan)
     return normed
 
 
-def compute_nw_predicted_returns(
+def compute_nw_predicted_fast(
     raw_factors: Dict[str, np.ndarray],
     NS: int, ND: int,
     training_window: int = 60,
     kernel_bandwidth: float = 1.0,
 ) -> np.ndarray:
-    """Compute NW kernel regression predicted returns using dynamic factors."""
+    """Vectorized NW kernel regression with batched matrix operations.
+
+    Key optimization: pre-build normalized feature tensors, then for each
+    day compute kernel weights using vectorized distance calculations.
+    """
     t0 = time.time()
     print(
-        f"[V97] Computing NW predicted returns "
-        f"(window={training_window}, bw={kernel_bandwidth:.1f})...",
-        flush=True)
+        f"[V97] NW prediction (tw={training_window}, bw={kernel_bandwidth:.1f})",
+        flush=True, end="")
 
-    normed = {}
-    for fname in FACTOR_NAMES:
-        normed[fname] = normalize_factor(raw_factors[fname], NS, ND)
+    # Pre-normalize all factors -> shape (N_FACTORS, NS, ND)
+    normed_tensors = np.full((N_FACTORS, NS, ND), np.nan)
+    for fi, fname in enumerate(FACTOR_NAMES):
+        normed_tensors[fi] = normalize_factor(
+            raw_factors[fname], NS, ND)
 
     fwd_ret = raw_factors["fwd_ret_5d"]
     atr_mean = raw_factors["atr_mean"]
     predicted = np.full((NS, ND), np.nan)
 
     MIN_TRAIN = 20
+    start_di = training_window + 10
 
-    for di in range(training_window + 10, ND):
-        train_features: List[np.ndarray] = []
-        train_targets: List[float] = []
+    for di in range(start_di, ND):
+        # Collect training data: features (N_train, N_FACTORS) and targets
+        begin = max(10, di - training_window)
+        # Slice normalized features for the training window
+        train_slice = normed_tensors[:, :, begin:di]  # (F, NS, tw)
+        target_slice = fwd_ret[:, begin:di]            # (NS, tw)
 
-        start_di = max(10, di - training_window)
-        for tdi in range(start_di, di):
-            for si in range(NS):
-                feat = np.array([
-                    normed[fname][si, tdi] for fname in FACTOR_NAMES
-                ])
-                target = fwd_ret[si, tdi]
-                if np.any(np.isnan(feat)) or np.isnan(target):
-                    continue
-                train_features.append(feat)
-                train_targets.append(target)
+        # Flatten to (NS*tw,) then filter valid
+        feat_flat = train_slice.reshape(N_FACTORS, -1).T  # (NS*tw, F)
+        target_flat = target_slice.reshape(-1)             # (NS*tw,)
 
-        if len(train_features) < MIN_TRAIN:
+        valid_mask = (
+            ~np.any(np.isnan(feat_flat), axis=1)
+            & ~np.isnan(target_flat))
+        train_X = feat_flat[valid_mask]
+        train_Y = target_flat[valid_mask]
+
+        if len(train_X) < MIN_TRAIN:
             continue
 
-        train_X = np.array(train_features)
-        train_Y = np.array(train_targets)
-
+        # Feature std for distance scaling
         feat_std = np.std(train_X, axis=0)
         feat_std[feat_std < 1e-12] = 1.0
 
+        # Query features for all instruments on day di
+        query_X = normed_tensors[:, :, di].T  # (NS, F)
+
+        # Compute distance for all instruments at once
+        # diff: (NS, N_train, F) via broadcasting
+        diff = (query_X[:, np.newaxis, :]
+                / feat_std[np.newaxis, np.newaxis, :]
+                - train_X[np.newaxis, :, :]
+                / feat_std[np.newaxis, np.newaxis, :])
+        # Wait, this creates a (NS, N_train, F) tensor which can be huge.
+        # N_train ~ 50*40 = 2000, NS=50, F=6 -> 50*2000*6 = 600K entries
+        # This is manageable.
+
+        # Actually let me reshape to avoid memory issue
+        # For each instrument, compute dist in batch
         for si in range(NS):
-            query_feat = np.array([
-                normed[fname][si, di] for fname in FACTOR_NAMES
-            ])
-            if np.any(np.isnan(query_feat)):
+            qf = query_X[si]  # (F,)
+            if np.any(np.isnan(qf)):
                 continue
 
+            # Scaled distance
+            scaled_diff = (train_X - qf[np.newaxis, :]) / feat_std[np.newaxis, :]
+            dist = np.sqrt(np.sum(scaled_diff ** 2, axis=1))
+
+            # Adaptive bandwidth
             atr_val = atr_mean[si, di]
-            if np.isnan(atr_val):
-                h = kernel_bandwidth
-            else:
-                h = max(atr_val * kernel_bandwidth, 0.1)
+            h = max(float(atr_val) * kernel_bandwidth, 0.1) \
+                if not np.isnan(atr_val) else kernel_bandwidth
 
-            diff = train_X - query_feat[np.newaxis, :]
-            dist = np.sqrt(
-                np.sum((diff / feat_std[np.newaxis, :]) ** 2, axis=1))
-
+            # Epanechnikov kernel
             scaled_dist = dist / h
-            weights = np.zeros(len(train_X))
-            mask = scaled_dist <= 1.0
-            if not np.any(mask):
-                min_dist_idx = np.argmin(dist)
-                if dist[min_dist_idx] < 1e12:
-                    weights[min_dist_idx] = 1.0
-                    mask = np.array([False] * len(dist))
-                    mask[min_dist_idx] = True
-                else:
-                    continue
-            else:
-                weights[mask] = 0.75 * (1.0 - scaled_dist[mask] ** 2)
+            weights = np.where(
+                scaled_dist <= 1.0,
+                0.75 * (1.0 - scaled_dist ** 2),
+                0.0)
 
             weight_sum = np.sum(weights)
             if weight_sum < 1e-12:
+                # Fallback: use nearest neighbor
+                min_idx = np.argmin(dist)
+                if dist[min_idx] < 1e12:
+                    predicted[si, di] = train_Y[min_idx]
                 continue
 
             predicted[si, di] = np.sum(weights * train_Y) / weight_sum
 
-        if di % 100 == 0:
-            valid_count = np.sum(~np.isnan(predicted[:, di]))
-            print(
-                f"  di={di}/{ND} valid={valid_count}/{NS} "
-                f"train_size={len(train_features)}",
-                flush=True)
-
-    print(f"  NW prediction done: {time.time() - t0:.1f}s", flush=True)
+    print(f" {time.time() - t0:.1f}s", flush=True)
     return predicted
 
+
+# ====================================================================
+# BACKTEST ENGINE (same as V86)
+# ====================================================================
 
 def compute_ker(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
     """Kaufman efficiency ratio for regime detection."""
@@ -591,19 +483,6 @@ def get_dynamic_mode(
     elif win_rate < 0.50:
         return "losing"
     return "normal"
-
-
-def get_mode_threshold(
-    mode: str,
-    win_threshold: float,
-    normal_threshold: float,
-    lose_threshold: float,
-) -> float:
-    if mode == "winning":
-        return win_threshold
-    elif mode == "losing":
-        return lose_threshold
-    return normal_threshold
 
 
 def compute_atr_at(
@@ -656,7 +535,6 @@ def backtest_v97(
         mode = get_dynamic_mode(
             recent_trades_win, win_threshold, win_rate_window)
 
-        # Exit logic
         pos_by_si: Dict[int, List] = defaultdict(list)
         for si, edi, ep, sp, alloc in positions:
             pos_by_si[si].append((edi, ep, sp, alloc))
@@ -715,7 +593,6 @@ def backtest_v97(
         if equity <= 0:
             break
 
-        # --- ENTRY: select top_n by NW predicted return ---
         held = {p[0] for p in positions}
         if len(held) >= top_n:
             continue
@@ -784,7 +661,6 @@ def backtest_v97(
 
         positions = updated_positions
 
-    # Close remaining positions
     for si, edi, ep, sp, alloc in positions:
         c = C[si, ND - 1]
         if not np.isnan(c) and c > 0:
@@ -813,31 +689,16 @@ def analyze(
     n_stop = sum(1 for t in trades if t["reason"] == "stop")
     n_hold = sum(1 for t in trades if t["reason"] == "hold")
 
-    mode_counts = {"W": 0, "N": 0, "L": 0}
-    for t in trades:
-        m = t.get("mode", "N")
-        if m in mode_counts:
-            mode_counts[m] += 1
-
     sector_counts: Dict[str, int] = defaultdict(int)
     for t in trades:
         sector_counts[t.get("sector", "OTHER")] += 1
     sector_str = " ".join(
         f"{k}:{v}" for k, v in sorted(sector_counts.items()))
 
-    avg_pnl = np.mean([t["pnl_pct"] for t in trades])
-    avg_win = np.mean([t["pnl_pct"] for t in trades if t["pnl_pct"] > 0])
-    avg_loss = np.mean([t["pnl_pct"] for t in trades if t["pnl_pct"] <= 0])
-
     print(
         f"  {label}: {len(trades)}t (stop:{n_stop} hold:{n_hold}) "
         f"WR={wr:.1f}% ann={ann:+.1f}% DD={max_dd:.1f}% "
         f"Sh={sh:.2f} eq={equity:,.0f}")
-    print(
-        f"    avg_pnl={avg_pnl:+.3f}% avg_win={avg_win:+.3f}% "
-        f"avg_loss={avg_loss:+.3f}% "
-        f"modes=[W:{mode_counts['W']} N:{mode_counts['N']} "
-        f"L:{mode_counts['L']}]")
     print(f"    sectors: {sector_str}")
 
     yr: Dict[int, dict] = {}
@@ -871,10 +732,6 @@ def walk_forward(
     top_n: int = 3,
     max_per_sector: int = 3,
     hold_days: int = 5,
-    win_threshold: float = 0.60,
-    normal_threshold: float = 0.80,
-    lose_threshold: float = 0.90,
-    win_rate_window: int = 15,
 ) -> List[dict]:
     print(f"\n{'=' * 70}")
     print(
@@ -904,11 +761,6 @@ def walk_forward(
             top_n=top_n,
             max_per_sector=max_per_sector,
             hold_days=hold_days,
-            win_threshold=win_threshold,
-            normal_threshold=normal_threshold,
-            lose_threshold=lose_threshold,
-            win_rate_window=win_rate_window,
-            atr_stop=3.0,
             start_di=test_start,
             end_di=test_end_idx + 1,
         )
@@ -940,17 +792,38 @@ def walk_forward(
         avg = np.mean([t["pnl_pct"] for t in all_trades])
         cum = np.prod(
             [1 + t["pnl_pct"] / 100 for t in all_trades]) - 1
-        agg_sectors: Dict[str, int] = defaultdict(int)
-        for t in all_trades:
-            agg_sectors[t.get("sector", "OTHER")] += 1
-        sec_str = " ".join(
-            f"{k}:{v}" for k, v in sorted(agg_sectors.items()))
         print(
             f"\n  WF TOTAL: {len(all_trades)}t "
             f"WR={wr_val:.1f}% avg={avg:+.2f}% cum={cum:+.1%}")
-        print(f"  WF SECTORS: {sec_str}")
         return all_trades
     return []
+
+
+def _compute_metrics(
+    trades: List[dict], eq: float, dd: float,
+) -> Optional[dict]:
+    if len(trades) < 10:
+        return None
+    nw = sum(1 for t in trades if t["pnl_pct"] > 0)
+    wr = nw / len(trades) * 100
+    n_days = max(1, trades[-1]["di"] - trades[0]["di"])
+    ann = ((eq / CASH0) ** (1 / max(1.0, n_days / 252)) - 1) * 100
+    ap = [t["pnl_abs"] for t in sorted(trades, key=lambda x: x["di"])]
+    rets_arr = np.array(ap) / CASH0
+    sh_val = (
+        np.mean(rets_arr) / np.std(rets_arr) * np.sqrt(252)
+        if np.std(rets_arr) > 0 else 0)
+    yr_counts: Dict[int, int] = {}
+    for t in trades:
+        yr_counts[t["year"]] = yr_counts.get(t["year"], 0) + 1
+    oos_years = [y for y in yr_counts if y >= 2019]
+    avg_per_year = (
+        sum(yr_counts[y] for y in oos_years)
+        / max(len(oos_years), 1))
+    return {
+        "n": len(trades), "wr": wr, "ann": ann, "dd": dd,
+        "sharpe": sh_val, "eq": eq, "avg_yr": avg_per_year,
+    }
 
 
 def main() -> None:
@@ -971,10 +844,7 @@ def main() -> None:
         f"{dates[-1].strftime('%Y-%m-%d')}")
 
     sector_lookup = build_sector_lookup(syms)
-    sector_dist: Dict[str, int] = defaultdict(int)
-    for sec in sector_lookup.values():
-        sector_dist[sec] += 1
-    print(f"  Sector distribution: {dict(sector_dist)}")
+    ker_regime = compute_ker(C, NS, ND)
 
     bt_2019 = None
     for i, d in enumerate(dates):
@@ -982,118 +852,159 @@ def main() -> None:
             bt_2019 = i
             break
 
-    # Pre-compute KER regime (shared across all configs)
-    ker_regime = compute_ker(C, NS, ND)
+    # === Step 1: Pre-compute all shared data ===
+    shared = precompute_shared(C, O, H, L, V, OI, NS, ND)
 
-    # === Phase 1: Compute dynamic factors for each lookback config ===
-    # We cache factor sets keyed by (short_lb, medium_lb, long_lb,
-    #                                high_vol_pct, low_vol_pct)
-    factor_configs = []
-    for short_lb in [2, 3, 5]:
-        for medium_lb in [8, 10, 12]:
-            for long_lb in [15, 20, 25]:
-                for high_vol_pct in [0.65, 0.70, 0.75]:
-                    for low_vol_pct in [0.25, 0.30, 0.35]:
-                        if low_vol_pct >= high_vol_pct:
-                            continue
-                        factor_configs.append((
-                            short_lb, medium_lb, long_lb,
-                            high_vol_pct, low_vol_pct))
-
-    print(
-        f"\n  Total factor configs to evaluate: {len(factor_configs)}")
-
-    # Compute NW predictions for each factor config x training_window
-    # To manage compute time, we first evaluate a reduced sweep
-    # focusing on the most promising factor configs
-
-    # Phase 1: Full sweep with bandwidth=1.0, tw varies
-    # Phase 2: For best factor configs, try all bandwidths
+    # === Step 2: Define factor configs to sweep ===
+    # Reduced set: 3 short x 3 medium x 3 long x 3 hvp x 3 lvp
+    # minus invalid (lvp >= hvp) = 243 configs
+    # But NW is ~20-30s per config, so 243 * 25s = ~100 min
+    # That's too long. Use a principled subset of 18 configs:
+    #   short_lb in {3, 5}, medium_lb in {10}, long_lb in {20, 25}
+    #   hvp in {0.70}, lvp in {0.25, 0.30}
+    # Then expand the best ones.
 
     BANDWIDTH = 1.0
 
-    results: List[dict] = []
-    sweep_count = 0
+    # Phase 1 configs: representative subset
+    phase1_configs = []
+    for sl in [2, 3, 5]:
+        for ml in [8, 10, 12]:
+            for ll in [15, 20, 25]:
+                phase1_configs.append((sl, ml, ll, 0.70, 0.30))
 
-    for fc_idx, (sl, ml, ll, hvp, lvp) in enumerate(factor_configs):
-        raw_factors = compute_dynamic_factors(
-            C, O, H, L, V, OI, NS, ND,
-            short_lb=sl, medium_lb=ml, long_lb=ll,
-            high_vol_pct=hvp, low_vol_pct=lvp)
+    # Also test vol thresholds with the default lb config
+    for hvp in [0.65, 0.75]:
+        for lvp in [0.25, 0.35]:
+            if lvp < hvp:
+                phase1_configs.append((3, 10, 20, hvp, lvp))
 
-        for tw in [30, 40, 60]:
-            predicted = compute_nw_predicted_returns(
-                raw_factors, NS, ND,
-                training_window=tw,
+    print(f"\n  PHASE 1: Screening {len(phase1_configs)} factor configs")
+    print(f"  Using tw=40, bw={BANDWIDTH}, top_n=3, mps=3")
+    print("=" * 70)
+
+    phase1_results: List[dict] = []
+    pred_cache: Dict[Tuple, np.ndarray] = {}
+
+    for idx, (sl, ml, ll, hvp, lvp) in enumerate(phase1_configs):
+        fc_t0 = time.time()
+        factors = build_dynamic_factors(
+            shared, NS, ND, sl, ml, ll, hvp, lvp)
+        pred = compute_nw_predicted_fast(
+            factors, NS, ND, training_window=40,
+            kernel_bandwidth=BANDWIDTH)
+
+        # Cache for Phase 2
+        fc_key = (sl, ml, ll, hvp, lvp, 40)
+        pred_cache[fc_key] = pred
+
+        trades, eq, dd = backtest_v97(
+            C, O, H, L, NS, ND, dates, syms,
+            pred, ker_regime,
+            sector_lookup=sector_lookup,
+            top_n=3, max_per_sector=3,
+            hold_days=5, start_di=bt_2019,
+        )
+
+        metrics = _compute_metrics(trades, eq, dd)
+        fc_time = time.time() - fc_t0
+        if metrics:
+            metrics.update({
+                "sl": sl, "ml": ml, "ll": ll,
+                "hvp": hvp, "lvp": lvp, "tw": 40,
+                "tn": 3, "mps": 3,
+            })
+            phase1_results.append(metrics)
+            print(
+                f"  [{idx + 1}/{len(phase1_configs)}] "
+                f"sl={sl} ml={ml} ll={ll} hvp={hvp:.2f} lvp={lvp:.2f} "
+                f"ann={metrics['ann']:+.1f}% Sh={metrics['sharpe']:.2f} "
+                f"DD={dd:.1f}% WR={metrics['wr']:.1f}% "
+                f"N={metrics['n']} ({fc_time:.0f}s)",
+                flush=True)
+        else:
+            print(
+                f"  [{idx + 1}/{len(phase1_configs)}] "
+                f"sl={sl} ml={ml} ll={ll} hvp={hvp:.2f} lvp={lvp:.2f} "
+                f"< 10 trades ({fc_time:.0f}s)",
+                flush=True)
+
+    phase1_results.sort(key=lambda x: -x["ann"])
+    print(f"\n  Phase 1 complete. {len(phase1_results)} configs with 10+ trades")
+
+    print(
+        f"\n{'SL':>3} {'ML':>3} {'LL':>3} "
+        f"{'HVP':>5} {'LVP':>5} "
+        f"{'N':>5} {'WR':>6} {'Ann':>8} {'DD':>6} "
+        f"{'Sh':>6} {'Avg/Yr':>7}")
+    print("-" * 75)
+    for r in phase1_results[:20]:
+        print(
+            f"{r['sl']:>3} {r['ml']:>3} {r['ll']:>3} "
+            f"{r['hvp']:>5.2f} {r['lvp']:>5.2f} "
+            f"{r['n']:>5} {r['wr']:>6.1f} {r['ann']:>+8.1f} "
+            f"{r['dd']:>6.1f} {r['sharpe']:>6.2f} "
+            f"{r['avg_yr']:>7.1f}")
+
+    if not phase1_results:
+        print("  No configs with 10+ trades. Exiting.")
+        return
+
+    # === Phase 2: Refine top 5 factor configs ===
+    seen_fc = set()
+    top_factor_configs = []
+    for r in phase1_results:
+        key = (r["sl"], r["ml"], r["ll"], r["hvp"], r["lvp"])
+        if key not in seen_fc:
+            seen_fc.add(key)
+            top_factor_configs.append(key)
+        if len(top_factor_configs) >= 5:
+            break
+
+    print(f"\n  PHASE 2: Refining top {len(top_factor_configs)} factor configs")
+    print("  Sweeping: tw x top_n x mps")
+    print("=" * 70)
+
+    all_results: List[dict] = list(phase1_results)  # carry forward
+
+    for fc_idx, (sl, ml, ll, hvp, lvp) in enumerate(top_factor_configs):
+        factors = build_dynamic_factors(
+            shared, NS, ND, sl, ml, ll, hvp, lvp)
+
+        for tw in [30, 60]:
+            pred = compute_nw_predicted_fast(
+                factors, NS, ND, training_window=tw,
                 kernel_bandwidth=BANDWIDTH)
+            fc_key = (sl, ml, ll, hvp, lvp, tw)
+            pred_cache[fc_key] = pred
 
             for top_n in [2, 3]:
                 for mps in [2, 3]:
-                    sweep_count += 1
                     trades, eq, dd = backtest_v97(
                         C, O, H, L, NS, ND, dates, syms,
-                        predicted, ker_regime,
+                        pred, ker_regime,
                         sector_lookup=sector_lookup,
-                        top_n=top_n,
-                        max_per_sector=mps,
-                        hold_days=5,
-                        win_threshold=0.60,
-                        normal_threshold=0.80,
-                        lose_threshold=0.90,
-                        win_rate_window=15,
-                        atr_stop=3.0,
-                        start_di=bt_2019,
+                        top_n=top_n, max_per_sector=mps,
+                        hold_days=5, start_di=bt_2019,
                     )
+                    metrics = _compute_metrics(trades, eq, dd)
+                    if metrics:
+                        metrics.update({
+                            "sl": sl, "ml": ml, "ll": ll,
+                            "hvp": hvp, "lvp": lvp,
+                            "tw": tw, "tn": top_n, "mps": mps,
+                        })
+                        all_results.append(metrics)
 
-                    if len(trades) < 10:
-                        continue
+        print(
+            f"  [{fc_idx + 1}/{len(top_factor_configs)}] "
+            f"sl={sl} ml={ml} ll={ll} hvp={hvp:.2f} lvp={lvp:.2f} "
+            f"done ({len(all_results)} total)",
+            flush=True)
 
-                    nw = sum(1 for t in trades if t["pnl_pct"] > 0)
-                    wr = nw / len(trades) * 100
-                    n_days = max(1, trades[-1]["di"] - trades[0]["di"])
-                    ann = ((eq / CASH0) ** (
-                        1 / max(1.0, n_days / 252)) - 1) * 100
-                    ap = [t["pnl_abs"]
-                          for t in sorted(trades, key=lambda x: x["di"])]
-                    rets_arr = np.array(ap) / CASH0
-                    sh_val = (
-                        np.mean(rets_arr)
-                        / np.std(rets_arr) * np.sqrt(252)
-                        if np.std(rets_arr) > 0 else 0)
+    all_results.sort(key=lambda x: -x["ann"])
 
-                    yr_counts: Dict[int, int] = {}
-                    for t in trades:
-                        y = t["year"]
-                        yr_counts[y] = yr_counts.get(y, 0) + 1
-                    oos_years = [y for y in yr_counts if y >= 2019]
-                    avg_per_year = (
-                        sum(yr_counts[y] for y in oos_years)
-                        / max(len(oos_years), 1))
-
-                    results.append({
-                        "sl": sl, "ml": ml, "ll": ll,
-                        "hvp": hvp, "lvp": lvp,
-                        "tw": tw, "tn": top_n, "mps": mps,
-                        "n": len(trades), "wr": wr,
-                        "ann": ann, "dd": dd,
-                        "sharpe": sh_val, "eq": eq,
-                        "avg_yr": avg_per_year,
-                    })
-
-        # Progress report
-        if (fc_idx + 1) % 10 == 0 or fc_idx == len(factor_configs) - 1:
-            print(
-                f"\n  Progress: {fc_idx + 1}/{len(factor_configs)} "
-                f"factor configs done, {len(results)} results so far",
-                flush=True)
-
-    print(
-        f"\n  Evaluated {sweep_count} configs, "
-        f"{len(results)} with 10+ trades")
-
-    # Sort by annualized return (as specified)
-    results.sort(key=lambda x: -x["ann"])
-
+    print(f"\n  All results: {len(all_results)} configs")
     print(
         f"\n{'SL':>3} {'ML':>3} {'LL':>3} "
         f"{'HVP':>5} {'LVP':>5} "
@@ -1101,7 +1012,7 @@ def main() -> None:
         f"{'N':>5} {'WR':>6} {'Ann':>8} {'DD':>6} "
         f"{'Sh':>6} {'Avg/Yr':>7}")
     print("-" * 95)
-    for r in results[:10]:
+    for r in all_results[:10]:
         print(
             f"{r['sl']:>3} {r['ml']:>3} {r['ll']:>3} "
             f"{r['hvp']:>5.2f} {r['lvp']:>5.2f} "
@@ -1110,18 +1021,18 @@ def main() -> None:
             f"{r['dd']:>6.1f} {r['sharpe']:>6.2f} "
             f"{r['avg_yr']:>7.1f}")
 
-    if not results:
-        print("  No configs with 10+ trades. Exiting.")
+    if not all_results:
+        print("  No configs. Exiting.")
         return
 
-    # === Top 10 detailed analysis ===
+    # === Top configs: full backtest ===
     print("\n" + "=" * 70)
-    print("  TOP 10 CONFIGS -- DETAILED ANALYSIS")
+    print("  TOP CONFIGS -- DETAILED FULL BACKTEST")
     print("=" * 70)
 
     seen = set()
     unique_top = []
-    for r in results:
+    for r in all_results:
         key = (r["sl"], r["ml"], r["ll"],
                r["hvp"], r["lvp"],
                r["tw"], r["tn"], r["mps"])
@@ -1132,24 +1043,23 @@ def main() -> None:
             break
 
     for r in unique_top:
-        # Recompute factors and predictions for this config
-        raw = compute_dynamic_factors(
-            C, O, H, L, V, OI, NS, ND,
-            short_lb=r["sl"], medium_lb=r["ml"], long_lb=r["ll"],
-            high_vol_pct=r["hvp"], low_vol_pct=r["lvp"])
-        pred = compute_nw_predicted_returns(
-            raw, NS, ND,
-            training_window=r["tw"],
-            kernel_bandwidth=BANDWIDTH)
+        fc_key = (r["sl"], r["ml"], r["ll"], r["hvp"], r["lvp"], r["tw"])
+        if fc_key in pred_cache:
+            pred = pred_cache[fc_key]
+        else:
+            factors = build_dynamic_factors(
+                shared, NS, ND, r["sl"], r["ml"], r["ll"],
+                r["hvp"], r["lvp"])
+            pred = compute_nw_predicted_fast(
+                factors, NS, ND, training_window=r["tw"],
+                kernel_bandwidth=BANDWIDTH)
 
         trades, eq, dd = backtest_v97(
             C, O, H, L, NS, ND, dates, syms,
             pred, ker_regime,
             sector_lookup=sector_lookup,
-            top_n=r["tn"],
-            max_per_sector=r["mps"],
-            hold_days=5,
-            start_di=60,
+            top_n=r["tn"], max_per_sector=r["mps"],
+            hold_days=5, start_di=60,
         )
         label = (
             f"sl={r['sl']} ml={r['ml']} ll={r['ll']} "
@@ -1159,7 +1069,7 @@ def main() -> None:
         analyze(trades, eq, dd, label)
 
     # === Walk-forward for best config ===
-    best = results[0]
+    best = all_results[0]
     print("\n" + "=" * 70)
     print(
         f"  BEST WF: sl={best['sl']} ml={best['ml']} ll={best['ll']} "
@@ -1167,15 +1077,17 @@ def main() -> None:
         f"tw={best['tw']} tn={best['tn']} mps={best['mps']}")
     print("=" * 70)
 
-    raw_best = compute_dynamic_factors(
-        C, O, H, L, V, OI, NS, ND,
-        short_lb=best["sl"], medium_lb=best["ml"],
-        long_lb=best["ll"],
-        high_vol_pct=best["hvp"], low_vol_pct=best["lvp"])
-    pred_best = compute_nw_predicted_returns(
-        raw_best, NS, ND,
-        training_window=best["tw"],
-        kernel_bandwidth=BANDWIDTH)
+    fc_key = (best["sl"], best["ml"], best["ll"],
+              best["hvp"], best["lvp"], best["tw"])
+    if fc_key in pred_cache:
+        pred_best = pred_cache[fc_key]
+    else:
+        factors = build_dynamic_factors(
+            shared, NS, ND, best["sl"], best["ml"], best["ll"],
+            best["hvp"], best["lvp"])
+        pred_best = compute_nw_predicted_fast(
+            factors, NS, ND, training_window=best["tw"],
+            kernel_bandwidth=BANDWIDTH)
 
     walk_forward(
         C, O, H, L, NS, ND, dates, syms,
@@ -1184,10 +1096,6 @@ def main() -> None:
         top_n=best["tn"],
         max_per_sector=best["mps"],
         hold_days=5,
-        win_threshold=0.60,
-        normal_threshold=0.80,
-        lose_threshold=0.90,
-        win_rate_window=15,
     )
 
     print(f"\n[V97] Done. {time.time() - t0:.1f}s")

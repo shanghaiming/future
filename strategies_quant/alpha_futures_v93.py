@@ -503,21 +503,19 @@ def backtest_v93(
     predicted_return: np.ndarray,
     ker_regime: np.ndarray,
     sector_lookup: Dict[int, str],
-    top_n_clusters: int = 2,
     max_positions: int = 3,
     max_per_sector: int = 2,
     hold_days: int = 3,
     atr_stop: float = 3.0,
-    win_threshold: float = 0.60,
-    normal_threshold: float = 0.65,
-    lose_threshold: float = 0.70,
-    win_rate_window: int = 15,
+    min_pred_return: float = 0.0,
+    use_ker_gate: bool = True,
     start_di: int = 60,
     end_di: Optional[int] = None,
 ) -> Tuple[List[dict], float, float]:
     """Backtest V93: PRISM-VQ factor discretization.
 
-    Select instruments whose cluster has the highest predicted return.
+    Rank-based selection: sort by predicted cluster return, take top N.
+    No dynamic mode threshold — VQ codebook IS the signal model.
     """
     if end_di is None:
         end_di = ND - 1
@@ -527,18 +525,11 @@ def backtest_v93(
     max_dd = 0.0
     positions: List[Tuple[int, int, float, float, float, bool]] = []
     trades: List[dict] = []
-    recent_trades_win: List[int] = []
 
     for di in range(max(start_di, 1), end_di):
         d = dates[di]
         daily_pnl = 0.0
         new_positions: List[Tuple[int, int, float, float, float, bool]] = []
-
-        # Dynamic mode
-        mode = get_dynamic_mode(
-            recent_trades_win, win_threshold, win_rate_window)
-        current_threshold = get_mode_threshold(
-            mode, win_threshold, normal_threshold, lose_threshold)
 
         # Group positions by symbol
         pos_by_si: Dict[int, List] = defaultdict(list)
@@ -573,9 +564,8 @@ def backtest_v93(
                         "sector": sector_lookup.get(si, 'OTHER'),
                         "reason": "stop",
                         "pyr": is_pyr,
-                        "mode": mode[:1].upper(),
+                        "mode": "V",
                     })
-                    recent_trades_win.append(1 if is_win else 0)
             elif hold >= hold_days:
                 for edi, ep, sp, alloc, is_pyr in pos_list:
                     pnl = (c - ep) / ep - COMM
@@ -592,9 +582,8 @@ def backtest_v93(
                         "sector": sector_lookup.get(si, 'OTHER'),
                         "reason": "hold",
                         "pyr": is_pyr,
-                        "mode": mode[:1].upper(),
+                        "mode": "V",
                     })
-                    recent_trades_win.append(1 if is_win else 0)
             else:
                 for edi, ep, sp, alloc, is_pyr in pos_list:
                     new_positions.append((si, edi, ep, sp, alloc, is_pyr))
@@ -610,12 +599,11 @@ def backtest_v93(
         if equity <= 0:
             break
 
-        # --- ENTRY: select from top clusters ---
+        # --- ENTRY: rank-based selection from VQ predictions ---
         held = {p[0] for p in positions}
         if len(positions) >= max_positions:
             continue
 
-        # Rank instruments by predicted return
         candidates = []
         for si in range(NS):
             if si in held:
@@ -623,11 +611,11 @@ def backtest_v93(
             pred_ret = predicted_return[si, di]
             if np.isnan(pred_ret):
                 continue
-            # Filter: predicted return must be positive (buy signal)
-            if pred_ret <= current_threshold * 0.01:
+            # Minimum predicted return filter
+            if pred_ret < min_pred_return:
                 continue
             # KER regime gate: avoid trending instruments
-            if ker_regime[si, di] < 0:
+            if use_ker_gate and ker_regime[si, di] < 0:
                 continue
             if di + 1 >= ND or np.isnan(O[si, di + 1]):
                 continue
@@ -635,10 +623,6 @@ def backtest_v93(
 
         # Sort by predicted return (highest first)
         candidates.sort(key=lambda x: -x[0])
-
-        # Take instruments from top_n_clusters best predicted returns
-        if len(candidates) > max_positions * 3:
-            candidates = candidates[:max_positions * 3]
 
         # Sector-constrained selection
         sector_counts: Dict[str, int] = defaultdict(int)
@@ -737,9 +721,7 @@ def analyze(trades: List[dict], equity: float, max_dd: float,
     )
     print(
         f"    avg_pnl={avg_pnl:+.3f}% avg_win={avg_win:+.3f}% "
-        f"avg_loss={avg_loss:+.3f}% "
-        f"modes=[W:{mode_counts['W']} N:{mode_counts['N']} "
-        f"L:{mode_counts['L']}]"
+        f"avg_loss={avg_loss:+.3f}%"
     )
     print(f"    sectors: {sector_str}")
 
@@ -771,7 +753,6 @@ def walk_forward(
     predicted_return: np.ndarray,
     ker_regime: np.ndarray,
     sector_lookup: Dict[int, str],
-    top_n_clusters: int = 2,
     max_positions: int = 3,
     max_per_sector: int = 2,
     hold_days: int = 3,
@@ -779,7 +760,7 @@ def walk_forward(
     print(f"\n{'=' * 70}")
     print(
         f"  WALK-FORWARD V93 PRISM-VQ "
-        f"(top_n={top_n_clusters} mp={max_positions} "
+        f"(mp={max_positions} "
         f"mps={max_per_sector} hold={hold_days})"
     )
     print(f"{'=' * 70}")
@@ -802,7 +783,6 @@ def walk_forward(
             C, O, H, L, NS, ND, dates, syms,
             predicted_return, ker_regime,
             sector_lookup=sector_lookup,
-            top_n_clusters=top_n_clusters,
             max_positions=max_positions,
             max_per_sector=max_per_sector,
             hold_days=hold_days,
@@ -819,11 +799,6 @@ def walk_forward(
             nw = sum(1 for t in test_trades if t["pnl_pct"] > 0)
             wr_val = nw / n * 100
             avg = np.mean([t["pnl_pct"] for t in test_trades])
-            modes = {"W": 0, "N": 0, "L": 0}
-            for t in test_trades:
-                m = t.get("mode", "N")
-                if m in modes:
-                    modes[m] += 1
             yr_sectors: Dict[str, int] = defaultdict(int)
             for t in test_trades:
                 yr_sectors[t.get("sector", "OTHER")] += 1
@@ -831,7 +806,6 @@ def walk_forward(
                 f"{k}:{v}" for k, v in sorted(yr_sectors.items()))
             print(
                 f"  {test_year}: {n}t WR={wr_val:.1f}% avg={avg:+.2f}% "
-                f"modes=[W:{modes['W']} N:{modes['N']} L:{modes['L']}] "
                 f"sectors=[{sec_str}]",
                 flush=True,
             )
@@ -922,72 +896,76 @@ def main() -> None:
     for n_clusters in [6, 8, 10, 12, 16]:
         for training_window in [120, 180, 250]:
             pred_ret = vq_cache[(n_clusters, training_window)]
-            for top_n_clusters in [1, 2, 3]:
-                for max_positions in [2, 3, 4]:
-                    for max_per_sector in [2, 3]:
-                        for hold_days in [1, 3, 5]:
-                            sweep_count += 1
-                            trades, eq, dd = backtest_v93(
-                                C, O, H, L, NS, ND, dates, syms,
-                                pred_ret, ker_regime,
-                                sector_lookup=sector_lookup,
-                                top_n_clusters=top_n_clusters,
-                                max_positions=max_positions,
-                                max_per_sector=max_per_sector,
-                                hold_days=hold_days,
-                                start_di=bt_2019,
-                            )
+            for max_positions in [2, 3, 4]:
+                for max_per_sector in [2, 3]:
+                    for hold_days in [1, 3, 5]:
+                        for min_pred_return in [-0.005, 0.0, 0.002]:
+                            for use_ker_gate in [True, False]:
+                                sweep_count += 1
+                                trades, eq, dd = backtest_v93(
+                                    C, O, H, L, NS, ND, dates, syms,
+                                    pred_ret, ker_regime,
+                                    sector_lookup=sector_lookup,
+                                    max_positions=max_positions,
+                                    max_per_sector=max_per_sector,
+                                    hold_days=hold_days,
+                                    min_pred_return=min_pred_return,
+                                    use_ker_gate=use_ker_gate,
+                                    start_di=bt_2019,
+                                )
 
-                            if len(trades) < 10:
-                                continue
+                                if len(trades) < 10:
+                                    continue
 
-                            nw = sum(
-                                1 for t in trades
-                                if t["pnl_pct"] > 0)
-                            wr = nw / len(trades) * 100
-                            n_days = max(
-                                1,
-                                trades[-1]["di"] - trades[0]["di"])
-                            ann = ((eq / CASH0) ** (
-                                1 / max(1.0, n_days / 252)) - 1) * 100
-                            ap = [t["pnl_abs"]
-                                  for t in sorted(
-                                      trades, key=lambda x: x["di"])]
-                            rets_arr = np.array(ap) / CASH0
-                            sh_val = (
-                                np.mean(rets_arr)
-                                / np.std(rets_arr) * np.sqrt(252)
-                                if np.std(rets_arr) > 0 else 0)
+                                nw = sum(
+                                    1 for t in trades
+                                    if t["pnl_pct"] > 0)
+                                wr = nw / len(trades) * 100
+                                n_days = max(
+                                    1,
+                                    trades[-1]["di"] - trades[0]["di"])
+                                ann = ((eq / CASH0) ** (
+                                    1 / max(1.0, n_days / 252)) - 1) * 100
+                                ap = [t["pnl_abs"]
+                                      for t in sorted(
+                                          trades, key=lambda x: x["di"])]
+                                rets_arr = np.array(ap) / CASH0
+                                sh_val = (
+                                    np.mean(rets_arr)
+                                    / np.std(rets_arr) * np.sqrt(252)
+                                    if np.std(rets_arr) > 0 else 0)
 
-                            results.append({
-                                "K": n_clusters,
-                                "tw": training_window,
-                                "top_n": top_n_clusters,
-                                "mp": max_positions,
-                                "mps": max_per_sector,
-                                "hd": hold_days,
-                                "n": len(trades),
-                                "wr": wr,
-                                "ann": ann,
-                                "dd": dd,
-                                "sharpe": sh_val,
-                                "eq": eq,
-                            })
+                                results.append({
+                                    "K": n_clusters,
+                                    "tw": training_window,
+                                    "mp": max_positions,
+                                    "mps": max_per_sector,
+                                    "hd": hold_days,
+                                    "mpr": min_pred_return,
+                                    "ker": use_ker_gate,
+                                    "n": len(trades),
+                                    "wr": wr,
+                                    "ann": ann,
+                                    "dd": dd,
+                                    "sharpe": sh_val,
+                                    "eq": eq,
+                                })
 
     results.sort(key=lambda x: -x["ann"])
     print(f"\n  Evaluated {sweep_count} configs, "
           f"{len(results)} with 10+ trades")
     print(
-        f"\n{'K':>3} {'TW':>4} {'Tn':>3} {'MP':>3} {'MPS':>3} "
-        f"{'HD':>3} "
+        f"\n{'K':>3} {'TW':>4} {'MP':>3} {'MPS':>3} "
+        f"{'HD':>3} {'MPR':>6} {'KER':>4} "
         f"{'N':>5} {'WR':>5} {'Ann':>8} {'DD':>6} "
         f"{'Sh':>6} {'Equity':>12}"
     )
-    print("-" * 80)
+    print("-" * 90)
     for r in results[:10]:
         print(
-            f"{r['K']:>3} {r['tw']:>4} {r['top_n']:>3} "
+            f"{r['K']:>3} {r['tw']:>4} "
             f"{r['mp']:>3} {r['mps']:>3} {r['hd']:>3} "
+            f"{r['mpr']:>6.3f} {r['ker']:>4} "
             f"{r['n']:>5} {r['wr']:>5.1f} {r['ann']:>+8.1f} "
             f"{r['dd']:>6.1f} {r['sharpe']:>6.2f} "
             f"{r['eq']:>12,.0f}"
@@ -1005,8 +983,9 @@ def main() -> None:
     seen = set()
     unique_top = []
     for r in results:
-        key = (r["K"], r["tw"], r["top_n"],
-               r["mp"], r["mps"], r["hd"])
+        key = (r["K"], r["tw"],
+               r["mp"], r["mps"], r["hd"],
+               r["mpr"], r["ker"])
         if key not in seen:
             seen.add(key)
             unique_top.append(r)
@@ -1019,15 +998,17 @@ def main() -> None:
             C, O, H, L, NS, ND, dates, syms,
             pred_ret, ker_regime,
             sector_lookup=sector_lookup,
-            top_n_clusters=r["top_n"],
             max_positions=r["mp"],
             max_per_sector=r["mps"],
             hold_days=r["hd"],
+            min_pred_return=r["mpr"],
+            use_ker_gate=r["ker"],
             start_di=bt_2019,
         )
         label = (
-            f"K={r['K']} tw={r['tw']} top_n={r['top_n']} "
-            f"mp={r['mp']} mps={r['mps']} hd={r['hd']}"
+            f"K={r['K']} tw={r['tw']} "
+            f"mp={r['mp']} mps={r['mps']} hd={r['hd']} "
+            f"mpr={r['mpr']:.3f} ker={r['ker']}"
         )
         print(f"\n  {label}")
         analyze(trades, eq, dd, label)
@@ -1037,8 +1018,8 @@ def main() -> None:
     print("\n" + "=" * 70)
     print(
         f"  BEST WF: K={best['K']} tw={best['tw']} "
-        f"top_n={best['top_n']} mp={best['mp']} "
-        f"mps={best['mps']} hd={best['hd']}"
+        f"mp={best['mp']} mps={best['mps']} hd={best['hd']} "
+        f"mpr={best['mpr']:.3f} ker={best['ker']}"
     )
     print("=" * 70)
     walk_forward(
@@ -1046,7 +1027,6 @@ def main() -> None:
         vq_cache[(best["K"], best["tw"])],
         ker_regime,
         sector_lookup=sector_lookup,
-        top_n_clusters=best["top_n"],
         max_positions=best["mp"],
         max_per_sector=best["mps"],
         hold_days=best["hd"],
@@ -1063,10 +1043,11 @@ def main() -> None:
         C, O, H, L, NS, ND, dates, syms,
         pred_ret_best, ker_regime,
         sector_lookup=sector_lookup,
-        top_n_clusters=best["top_n"],
         max_positions=best["mp"],
         max_per_sector=best["mps"],
         hold_days=best["hd"],
+        min_pred_return=best["mpr"],
+        use_ker_gate=best["ker"],
         start_di=bt_2019,
     )
     print(f"\n  V93 PRISM-VQ (K={best['K']} tw={best['tw']}):")
@@ -1079,8 +1060,8 @@ def main() -> None:
     for i, r in enumerate(results[:10]):
         print(
             f"  #{i + 1}: K={r['K']:>2} tw={r['tw']:>3} "
-            f"top_n={r['top_n']} mp={r['mp']} mps={r['mps']} "
-            f"hd={r['hd']} | "
+            f"mp={r['mp']} mps={r['mps']} "
+            f"hd={r['hd']} mpr={r['mpr']:.3f} ker={r['ker']} | "
             f"N={r['n']:>4} WR={r['wr']:>5.1f}% "
             f"Ann={r['ann']:>+7.1f}% DD={r['dd']:>5.1f}% "
             f"Sh={r['sharpe']:>5.2f}"
