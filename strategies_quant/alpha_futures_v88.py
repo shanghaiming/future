@@ -464,38 +464,42 @@ def select_top_factors(
     mi_scores: Dict[str, float],
     ic_scores: Dict[str, float],
     n_top: int = 8,
+    method: str = "ic_first",
 ) -> List[Tuple[str, float]]:
-    """Select top factors by combining MI and IC rankings.
+    """Select top factors using IC-first approach.
 
-    Uses a combined score: 0.5 * MI_rank + 0.5 * |IC|_rank
-    to balance information content and predictive direction.
+    IC (Spearman rank correlation) captures DIRECTIONAL predictability.
+    MI captures any statistical dependence (including non-directional).
+
+    Strategy: Use |IC| as primary selection criterion and as weights.
+    This ensures selected factors actually predict future returns directionally,
+    unlike MI which can select non-directional factors (e.g., volatility).
     """
     factor_names = list(mi_scores.keys())
 
-    # Rank by MI (higher = better)
-    mi_ranked = sorted(factor_names, key=lambda x: -mi_scores[x])
-    mi_rank_map = {name: rank for rank, name in enumerate(mi_ranked)}
+    if method == "ic_first":
+        # Sort by |IC| -- primary criterion for directional prediction
+        sorted_factors = sorted(factor_names, key=lambda x: -abs(ic_scores[x]))
+        selected = sorted_factors[:n_top]
 
-    # Rank by |IC| (higher absolute = better)
-    ic_ranked = sorted(factor_names, key=lambda x: -abs(ic_scores[x]))
-    ic_rank_map = {name: rank for rank, name in enumerate(ic_ranked)}
-
-    # Combined rank
-    combined = [(name, mi_rank_map[name] + ic_rank_map[name]) for name in factor_names]
-    combined.sort(key=lambda x: x[1])
-
-    # Use |IC| as weight for selected factors (normalized to sum to 1)
-    selected = combined[:n_top]
-    weights = []
-    for name, _ in selected:
-        ic = abs(ic_scores.get(name, 0.0))
-        weights.append(max(ic, 1e-6))
+        # Weight by |IC| (stronger prediction = higher weight)
+        weights = [max(abs(ic_scores[n]), 1e-6) for n in selected]
+    else:
+        # Combined rank (legacy method)
+        mi_ranked = sorted(factor_names, key=lambda x: -mi_scores[x])
+        mi_rank_map = {name: rank for rank, name in enumerate(mi_ranked)}
+        ic_ranked = sorted(factor_names, key=lambda x: -abs(ic_scores[x]))
+        ic_rank_map = {name: rank for rank, name in enumerate(ic_ranked)}
+        combined = [(name, mi_rank_map[name] + ic_rank_map[name]) for name in factor_names]
+        combined.sort(key=lambda x: x[1])
+        selected = [name for name, _ in combined[:n_top]]
+        weights = [max(abs(ic_scores.get(n, 0.0)), 1e-6) for n in selected]
 
     total_w = sum(weights)
     norm_weights = [w / total_w for w in weights]
 
-    result = [(name, w) for (name, _), w in zip(selected, norm_weights)]
-    print(f"\n  Selected top {n_top} factors:")
+    result = [(name, w) for name, w in zip(selected, norm_weights)]
+    print(f"\n  Selected top {n_top} factors (method={method}):")
     for name, w in result:
         mi_val = mi_scores[name]
         ic_val = ic_scores[name]
@@ -508,21 +512,18 @@ def build_weighted_composite(
     factor_weights: List[Tuple[str, float]],
     NS: int, ND: int,
 ) -> np.ndarray:
-    """Build weighted composite score from selected factors."""
-    composite = np.full((NS, ND), np.nan)
-    for di in range(ND):
-        for si in range(NS):
-            wsum = 0.0
-            wval = 0.0
-            for name, weight in factor_weights:
-                rv = ranks[name][si, di]
-                if np.isnan(rv):
-                    continue
-                wval += rv * weight
-                wsum += weight
-            if wsum > 0:
-                composite[si, di] = wval / wsum
-    return composite
+    """Build weighted composite score from selected factors (vectorized)."""
+    composite = np.zeros((NS, ND))
+    weight_sum = np.zeros((NS, ND))
+    for name, weight in factor_weights:
+        rank_arr = ranks[name]
+        valid = ~np.isnan(rank_arr)
+        composite = np.where(valid, composite + rank_arr * weight, composite)
+        weight_sum = np.where(valid, weight_sum + weight, weight_sum)
+    result = np.full((NS, ND), np.nan)
+    has_weight = weight_sum > 0
+    result[has_weight] = composite[has_weight] / weight_sum[has_weight]
+    return result
 
 
 # ============================================================
@@ -950,12 +951,18 @@ def main() -> None:
     print("  STEP 4: Select top factors")
     print("=" * 70)
 
-    # Test different numbers of top factors
+    # Test different numbers of top factors (IC-first selection)
     composites = {}
-    for n_top in [6, 8, 10, 12]:
-        selected = select_top_factors(mi_scores, ic_scores, n_top=n_top)
+    for n_top in [5, 6, 8, 10]:
+        selected = select_top_factors(mi_scores, ic_scores, n_top=n_top, method="ic_first")
         comp = build_weighted_composite(ranks, selected, NS, ND)
-        composites[n_top] = (comp, selected)
+        composites[f"ic{n_top}"] = (comp, selected)
+
+    # Also test with combined method for comparison
+    for n_top in [8, 10]:
+        selected = select_top_factors(mi_scores, ic_scores, n_top=n_top, method="combined")
+        comp = build_weighted_composite(ranks, selected, NS, ND)
+        composites[f"combo{n_top}"] = (comp, selected)
 
     # Also build the V80 baseline composite (7 existing factors with V80 weights)
     v80_weights = {
@@ -980,10 +987,10 @@ def main() -> None:
 
     for comp_name, (composite, selected) in composites.items():
         for mps in [2, 3]:
-            for mp in [3, 5, 8]:
-                for wt in [0.55, 0.60, 0.65]:
-                    for nt in [0.75, 0.80, 0.85]:
-                        for lt in [0.85, 0.90, 0.95]:
+            for mp in [3, 5, 8, 12]:
+                for wt in [0.50, 0.55, 0.60, 0.65]:
+                    for nt in [0.65, 0.70, 0.75, 0.80, 0.85]:
+                        for lt in [0.80, 0.85, 0.90, 0.95]:
                             if lt <= nt:
                                 continue
                             sweep_count += 1
