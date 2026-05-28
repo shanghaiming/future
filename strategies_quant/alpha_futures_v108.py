@@ -295,7 +295,7 @@ def backtest_v108(C,O,H,L,NS,ND,dates,syms,pred,ker,pv,sl,sim,
             ee = min(p[1] for p in pl); hold = di-ee
             stopped = any(c < p[3] for p in pl)
             if stopped or hold >= hd:
-                for edi_,ep,sp,al in pl:
+                for _,edi_,ep,sp,al in pl:
                     pnl = (c-ep)/ep-COMM; pr = eq*al*pnl; dpnl += pr
                     trades.append({"pnl_abs":pr,"pnl_pct":pnl*100,"days":di-edi_+1,
                                    "di":di,"year":d.year,"sym":syms[si],

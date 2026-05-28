@@ -345,12 +345,6 @@ def compute_atr(H, L, C, si, di, start_di) -> Optional[float]:
 def compute_port_vol(C: np.ndarray, NS: int, ND: int, vlb: int = 15) -> np.ndarray:
     pv = np.full(ND, np.nan)
     for di in range(vlb+1, ND):
-        dr = [np.mean([C[si,dd]/C[si,dd-1]-1 for si in range(NS)
-                       if not np.isnan(C[si,dd]) and not np.isnan(C[si,dd-1]) and C[si,dd-1]>0])
-              for dd in range(di-vlb, di)]
-        dr = [r for r in dr if not np.isnan(r) and len([C[si,dd] for si in range(NS)
-              if not np.isnan(C[si,dd]) and not np.isnan(C[si,dd-1]) and C[si,dd-1]>0]) > 0]
-        # Simpler: just compute
         drets = []
         for dd in range(di-vlb, di):
             rs = [C[si,dd]/C[si,dd-1]-1 for si in range(NS)

@@ -954,7 +954,14 @@ def main() -> None:
     # === Step 4: Compute portfolio volatility ===
     port_vol = compute_portfolio_volatility(C, NS, ND, vol_lookback=20)
 
-    # === Step 5: Parameter sweep ===
+    # === Step 5: Pre-compute KER regime arrays for all thresholds ===
+    ker_skip_values = [0.25, 0.30, 0.35]
+    ker_regime_cache: Dict[float, np.ndarray] = {}
+    for ks in ker_skip_values:
+        print(f"  Pre-computing ker_regime for skip={ks:.2f}...", flush=True)
+        ker_regime_cache[ks] = compute_ker_regime(ker_10, NS, ND, ks)
+
+    # === Step 6: Parameter sweep ===
     print("\n" + "=" * 70)
     print("  PARAMETER SWEEP (2019-2026)")
     print("  NO LEVERAGE. All 5 innovation layers active.")
@@ -967,12 +974,15 @@ def main() -> None:
         for sigmoid_steepness in [3.0, 5.0, 7.0]:
             for top_n in [2, 3]:
                 for mps in [2, 3]:
-                    for ker_skip in [0.25, 0.30, 0.35]:
+                    for ker_skip in ker_skip_values:
                         for win_thresh in [0.55, 0.60, 0.65]:
                             for sgw in [30, 60, 90]:
                                 sweep_count += 1
-                                ker_regime = compute_ker_regime(
-                                    ker_10, NS, ND, ker_skip)
+                                if sweep_count % 100 == 0:
+                                    print(
+                                        f"  sweep {sweep_count}...",
+                                        flush=True)
+                                ker_regime = ker_regime_cache[ker_skip]
                                 trades, eq, dd = backtest_v115(
                                     C, O, H, L, NS, ND,
                                     dates, syms,
@@ -1047,7 +1057,7 @@ def main() -> None:
         print("  No configs with 10+ trades. Exiting.")
         return
 
-    # === Step 6: Walk-forward for top configs ===
+    # === Step 7: Walk-forward for top configs ===
     best_by_sharpe = max(results, key=lambda x: x["sharpe"])
     best_by_ann = results[0]
     best_risk_adj = max(
@@ -1059,8 +1069,7 @@ def main() -> None:
         ("BEST-SHARPE", best_by_sharpe),
         ("BEST-RISK-ADJ", best_risk_adj),
     ]:
-        ker_regime = compute_ker_regime(
-            ker_10, NS, ND, best["ker"])
+        ker_regime = ker_regime_cache[best["ker"]]
         walk_forward(
             C, O, H, L, NS, ND, dates, syms,
             predicted, ker_regime, port_vol,
@@ -1076,15 +1085,14 @@ def main() -> None:
             label=label,
         )
 
-    # === Step 7: Final comparison ===
+    # === Step 8: Final comparison ===
     print("\n" + "=" * 70)
     print("  COMPARISON: V115 vs V96 (+73.1%) vs V80 (+36.4%)")
     print("  (2019-2026 OOS)")
     print("=" * 70)
 
     # Full-period backtest for best config
-    ker_regime_best = compute_ker_regime(
-        ker_10, NS, ND, best_by_ann["ker"])
+    ker_regime_best = ker_regime_cache[best_by_ann["ker"]]
     trades_v115, eq_v115, dd_v115 = backtest_v115(
         C, O, H, L, NS, ND, dates, syms,
         predicted, ker_regime_best, port_vol,

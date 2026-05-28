@@ -305,10 +305,10 @@ def backtest(C,O,H,L, NS,ND,dates,syms, signal, ker, sec_lk, top_n=2, mps=2, hd=
         for si,pl in pbs.items():
             c = C[si,di]
             if np.isnan(c): npos.extend(pl); continue
-            ee = min(p[0] for p in pl); hold = di-ee
-            stopped = any(c<p[2] for p in pl)
+            ee = min(p[1] for p in pl); hold = di-ee
+            stopped = any(c<p[3] for p in pl)
             if stopped or hold>=hd:
-                for edi2,ep,sp,al in pl:
+                for _,edi2,ep,sp,al in pl:
                     pnl = (c-ep)/ep-COMM; pr = eq*al*pnl; dpnl+=pr
                     trades.append({"pnl_abs":pr,"pnl_pct":pnl*100,"days":di-edi2+1,"di":di,"year":d.year,"sym":syms[si],"sector":sec_lk.get(si,'OTHER'),"reason":"stop" if stopped else "hold","mode":mode[0].upper()})
                     rwins.append(1 if pnl>0 else 0)

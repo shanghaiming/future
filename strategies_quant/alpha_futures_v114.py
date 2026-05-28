@@ -1,30 +1,18 @@
 """
 V114: H0 Microstructure Quality Filter + NW Kernel
 ====================================================
-Core Innovation: Use Hurst exponent H0 as a microstructure quality gate.
+Paper 2601.23172: H0 (~0.75) unifies order flow persistence, volume
+roughness, volatility roughness, and market impact. When H0 deviates,
+microstructure breaks down BEFORE prices reflect it.
 
-Paper 2601.23172 shows H0 (~0.75) unifies:
-  - Order flow persistence
-  - Volume roughness
-  - Volatility roughness
-  - Market impact square-root law
-
-When H0 deviates from its normal range (0.70-0.80), market microstructure
-is breaking down and our signals become unreliable. H0 breaks down BEFORE
-prices reflect the change -- it is a LEADING indicator.
-
-Architecture (based on V96, BMA removed for simplicity):
-  1. NW Kernel Regression for signal generation (from V86)
+Architecture (V96 base, BMA removed):
+  1. NW Kernel Regression (V86) for signal generation
   2. H0 estimation via R/S analysis on signed volume delta
-  3. H0-based position sizing multiplier (gate logic)
-  4. Volatility-adaptive sizing (from V96)
+  3. H0 position sizing gate + vol-adaptive sizing (V96)
 
-Walk-forward 2019-2026. No leverage. CASH0=1M, COMM=0.0005.
+Walk-forward 2019-2026. LEVERAGE=1.0, CASH0=1M, COMM=0.0005.
 """
-import sys
-import os
-import time
-import warnings
+import sys, os, time, warnings
 import numpy as np
 import pandas as pd
 from collections import defaultdict
@@ -32,7 +20,6 @@ from typing import Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from alpha_futures_data import load_all_data
 
 try:
@@ -41,1231 +28,575 @@ try:
 except ImportError:
     HAS_TALIB = False
 
-CASH0 = 1_000_000
-COMM = 0.0005
-LEVERAGE = 1.0
+CASH0, COMM, LEVERAGE = 1_000_000, 0.0005, 1.0
 
 SECTOR_MAP = {
-    'i': 'BLACK', 'j': 'BLACK', 'jm': 'BLACK', 'hc': 'BLACK',
-    'sf': 'BLACK', 'sm': 'BLACK', 'wr': 'BLACK', 'im': 'BLACK',
-    'cu': 'METAL', 'al': 'METAL', 'zn': 'METAL', 'pb': 'METAL',
-    'ni': 'METAL', 'sn': 'METAL', 'ss': 'METAL', 'ao': 'METAL',
-    'au': 'METAL', 'ag': 'METAL', 'rb': 'METAL', 'si': 'METAL',
-    'sc': 'ENERGY', 'fu': 'ENERGY', 'bu': 'ENERGY',
-    'pg': 'ENERGY', 'eb': 'ENERGY', 'ta': 'ENERGY',
-    'fg': 'ENERGY', 'oi': 'ENERGY',
-    'v': 'CHEMICAL', 'pp': 'CHEMICAL', 'l': 'CHEMICAL',
-    'eg': 'CHEMICAL', 'ma': 'CHEMICAL', 'sa': 'CHEMICAL',
-    'ur': 'CHEMICAL', 'pf': 'CHEMICAL', 'sh': 'CHEMICAL',
-    'lc': 'CHEMICAL',
-    'm': 'AGRI', 'y': 'AGRI', 'a': 'AGRI', 'p': 'AGRI',
-    'c': 'AGRI', 'cs': 'AGRI', 'jd': 'AGRI', 'rr': 'AGRI',
-    'lrm': 'AGRI', 'rm': 'AGRI', 'ru': 'AGRI',
-    'cf': 'SOFTS', 'sr': 'SOFTS', 'ap': 'SOFTS',
-    'cj': 'SOFTS', 'pk': 'SOFTS', 'lh': 'SOFTS',
-    'sp': 'SOFTS', 'b': 'SOFTS', 'br': 'SOFTS',
+    'i':'BLACK','j':'BLACK','jm':'BLACK','hc':'BLACK','sf':'BLACK',
+    'sm':'BLACK','wr':'BLACK','im':'BLACK',
+    'cu':'METAL','al':'METAL','zn':'METAL','pb':'METAL','ni':'METAL',
+    'sn':'METAL','ss':'METAL','ao':'METAL','au':'METAL','ag':'METAL',
+    'rb':'METAL','si':'METAL',
+    'sc':'ENERGY','fu':'ENERGY','bu':'ENERGY','pg':'ENERGY',
+    'eb':'ENERGY','ta':'ENERGY','fg':'ENERGY','oi':'ENERGY',
+    'v':'CHEMICAL','pp':'CHEMICAL','l':'CHEMICAL','eg':'CHEMICAL',
+    'ma':'CHEMICAL','sa':'CHEMICAL','ur':'CHEMICAL','pf':'CHEMICAL',
+    'sh':'CHEMICAL','lc':'CHEMICAL',
+    'm':'AGRI','y':'AGRI','a':'AGRI','p':'AGRI','c':'AGRI','cs':'AGRI',
+    'jd':'AGRI','rr':'AGRI','lrm':'AGRI','rm':'AGRI','ru':'AGRI',
+    'cf':'SOFTS','sr':'SOFTS','ap':'SOFTS','cj':'SOFTS','pk':'SOFTS',
+    'lh':'SOFTS','sp':'SOFTS','b':'SOFTS','br':'SOFTS',
 }
 
-FACTOR_NAMES = [
-    "ret_5d", "oi_5d", "rsi14", "vol_5d",
-    "ret_10d", "range_5d", "atrp_5d",
-]
+FACTOR_NAMES = ["ret_5d","oi_5d","rsi14","vol_5d","ret_10d","range_5d","atrp_5d"]
 N_FACTORS = len(FACTOR_NAMES)
 
 
-# =====================================================================
-# Utility helpers
-# =====================================================================
-
-def _extract_base_symbol(sym: str) -> str:
+def _base_sym(sym: str) -> str:
     s = sym.lower().split('.')[0].strip()
-    while s and s[-1].isdigit():
-        s = s[:-1]
-    if s.endswith('fi'):
-        s = s[:-2]
-    return s
+    while s and s[-1].isdigit(): s = s[:-1]
+    return s[:-2] if s.endswith('fi') else s
 
 
 def build_sector_lookup(syms: List[str]) -> Dict[int, str]:
-    sector_lookup: Dict[int, str] = {}
-    for si, sym in enumerate(syms):
-        base = _extract_base_symbol(sym)
-        sector_lookup[si] = SECTOR_MAP.get(base, 'OTHER')
-    return sector_lookup
+    return {si: SECTOR_MAP.get(_base_sym(s), 'OTHER') for si, s in enumerate(syms)}
 
 
-# =====================================================================
+# =================================================================
 # INNOVATION: H0 Microstructure Quality Filter
-# =====================================================================
+# =================================================================
 
-def compute_signed_volume_delta(
-    C: np.ndarray, H: np.ndarray, L: np.ndarray, V: np.ndarray,
-    NS: int, ND: int,
-) -> np.ndarray:
-    """Approximate signed order flow from OHLCV data.
-
-    VDP = V * (2C - H - L) / (H - L)
-    Measures directional volume pressure within each bar.
-    Returns (NS, ND) array of signed volume deltas.
-    """
+def compute_signed_volume_delta(C, H, L, V, NS, ND):
+    """Approximate signed order flow: VDP = V*(2C-H-L)/(H-L)."""
     svd = np.full((NS, ND), np.nan)
     for si in range(NS):
         for di in range(ND):
-            c_val = C[si, di]
-            h_val = H[si, di]
-            l_val = L[si, di]
-            v_val = V[si, di]
-            if np.isnan(c_val) or np.isnan(h_val) or np.isnan(l_val):
+            c, h, l, v = C[si,di], H[si,di], L[si,di], V[si,di]
+            if np.isnan(c) or np.isnan(h) or np.isnan(l) or np.isnan(v):
                 continue
-            if np.isnan(v_val) or v_val <= 0:
-                continue
-            denom = h_val - l_val
-            if denom < 1e-10:
-                continue
-            svd[si, di] = v_val * (2 * c_val - h_val - l_val) / denom
+            if v <= 0: continue
+            d = h - l
+            if d < 1e-10: continue
+            svd[si, di] = v * (2*c - h - l) / d
     return svd
 
 
-def estimate_h0_rs(
-    signed_vd: np.ndarray, NS: int, ND: int,
-    h0_window: int = 100,
-) -> np.ndarray:
+def estimate_h0_rs(svd, NS, ND, h0_window=100):
     """Estimate Hurst exponent via R/S analysis on signed volume delta.
 
-    For each instrument on each day, compute H0 using the past h0_window
-    observations. R/S analysis splits the series into chunks and measures
-    the rescaled range (R/S statistic) to estimate long-range dependence.
+    Two-layer approach:
+    1. Raw H0 via R/S analysis (clusters ~0.50 on daily data)
+    2. Rolling z-score of H0 relative to its own history
 
-    H ~ 0.5  => random walk (no persistence)
-    H ~ 0.75 => normal market microstructure (square-root impact law)
-    H > 0.9  => extreme persistence (climax/reversal risk)
-    H < 0.55 => microstructure breakdown (unreliable signals)
-
-    Returns (NS, ND) array of H0 estimates.
+    Returns (NS, ND) array. Values are z-scores: 0=normal, >2=extreme
+    persistence, <-2=breakdown. Use these z-scores in the gate.
     """
-    h0_array = np.full((NS, ND), np.nan)
+    # Step 1: Raw H0
+    raw_h0 = np.full((NS, ND), np.nan)
     for si in range(NS):
         for di in range(h0_window, ND):
-            window_data = signed_vd[si, di - h0_window:di]
-            valid = window_data[~np.isnan(window_data)]
-            n_valid = len(valid)
-            if n_valid < 30:
-                continue
+            w = svd[si, di-h0_window:di]
+            v = w[~np.isnan(w)]
+            nv = len(v)
+            if nv < 30: continue
+            nc = min(4, max(2, nv // 25))
+            cs = nv // nc
+            if cs < 10: continue
+            rs_vals = []
+            for ci in range(nc):
+                chunk = v[ci*cs:(ci+1)*cs]
+                if len(chunk) < cs: continue
+                dev = chunk - np.mean(chunk)
+                cd = np.cumsum(dev)
+                R = np.max(cd) - np.min(cd)
+                S = np.std(chunk, ddof=1)
+                if S > 1e-12 and R > 0:
+                    rs_vals.append(R / S)
+            if len(rs_vals) < 2: continue
+            mrs = np.mean(rs_vals)
+            if mrs > 0:
+                raw_h0[si, di] = max(0.2, min(1.5, np.log(mrs) / np.log(cs)))
 
-            # R/S analysis: split into 2-4 chunks
-            n_chunks = min(4, max(2, n_valid // 25))
-            chunk_size = n_valid // n_chunks
-            if chunk_size < 10:
-                continue
-
-            rs_values = []
-            for ci in range(n_chunks):
-                start = ci * chunk_size
-                chunk = valid[start:start + chunk_size]
-                if len(chunk) < chunk_size:
-                    continue
-                mean_val = np.mean(chunk)
-                deviations = chunk - mean_val
-                cum_dev = np.cumsum(deviations)
-                r_range = np.max(cum_dev) - np.min(cum_dev)
-                s_std = np.std(chunk, ddof=1)
-                if s_std > 1e-12 and r_range > 0:
-                    rs_values.append(r_range / s_std)
-
-            if len(rs_values) < 2:
-                continue
-
-            # H = log(mean(R/S)) / log(chunk_size)
-            mean_rs = np.mean(rs_values)
-            if mean_rs > 0:
-                h0_est = np.log(mean_rs) / np.log(chunk_size)
-                h0_array[si, di] = max(0.2, min(1.5, h0_est))
-    return h0_array
+    # Step 2: Rolling z-score of H0 (detects relative anomalies)
+    zscore = np.full((NS, ND), np.nan)
+    zscore_window = 120  # lookback for rolling stats
+    for si in range(NS):
+        for di in range(h0_window + zscore_window, ND):
+            hist = raw_h0[si, di-zscore_window:di]
+            valid = hist[~np.isnan(hist)]
+            if len(valid) < 20: continue
+            mu, sig = np.mean(valid), np.std(valid)
+            if sig < 1e-6: continue
+            current = raw_h0[si, di]
+            if not np.isnan(current):
+                zscore[si, di] = (current - mu) / sig
+    return zscore
 
 
-def get_h0_multiplier(
-    h0: float,
-    h0_normal_low: float = 0.65,
-    h0_normal_high: float = 0.85,
-    h0_crisis_mult: float = 0.3,
-    h0_extreme_mult: float = 0.5,
-    h0_mild_mult: float = 0.7,
-) -> float:
-    """Convert H0 estimate to position size multiplier.
+def get_h0_mult(z, nl=-1.0, nh=1.0, cr=0.3, ex=0.5):
+    """H0 z-score -> position multiplier.
 
-    Normal range (h0_normal_low to h0_normal_high): full size (1.0).
-    Crisis (H0 < 0.55): heavy reduction.
-    Extreme persistence (H0 > 0.90): moderate reduction.
-    Mild anomaly: slight reduction.
+    z near 0: normal microstructure (full size).
+    z < -2.0: H0 far below its own mean -> breakdown (reduce heavily).
+    z > +2.0: H0 far above -> extreme persistence (climax risk).
+    nl/nh: z-score band for "normal" (default -1 to +1 std devs).
     """
-    if np.isnan(h0):
-        return 0.7  # Missing data => conservative
-    if h0_normal_low <= h0 <= h0_normal_high:
-        return 1.0
-    if h0 < 0.55:
-        return h0_crisis_mult
-    if h0 > 0.90:
-        return h0_extreme_mult
-    return h0_mild_mult
+    if np.isnan(z): return 0.7
+    if nl <= z <= nh: return 1.0
+    if z < -2.0: return cr
+    if z > 2.0: return ex
+    return 0.7
 
 
-# =====================================================================
-# Factor computation (from V96, no BMA)
-# =====================================================================
+# =================================================================
+# Factor computation
+# =================================================================
 
-def compute_rsi_manual(
-    C: np.ndarray, NS: int, ND: int, period: int = 14,
-) -> np.ndarray:
+def compute_rsi_manual(C, NS, ND, period=14):
     rsi = np.full((NS, ND), np.nan)
     for si in range(NS):
-        c = C[si]
-        gains = np.full(ND, np.nan)
-        losses = np.full(ND, np.nan)
+        c = C[si]; g = np.full(ND, np.nan); lo = np.full(ND, np.nan)
         for di in range(1, ND):
-            if np.isnan(c[di]) or np.isnan(c[di - 1]):
-                continue
-            delta = c[di] - c[di - 1]
-            gains[di] = max(delta, 0.0)
-            losses[di] = max(-delta, 0.0)
-
-        avg_gain = np.nan
-        avg_loss = np.nan
+            if np.isnan(c[di]) or np.isnan(c[di-1]): continue
+            d = c[di] - c[di-1]
+            g[di], lo[di] = max(d,0), max(-d,0)
+        ag = al = np.nan
         for di in range(1, ND):
-            if np.isnan(gains[di]):
+            if np.isnan(g[di]): continue
+            if np.isnan(ag):
+                vg, vl = [], []
+                for j in range(di, min(di+period, ND)):
+                    if not np.isnan(g[j]):
+                        vg.append(g[j]); vl.append(lo[j] if not np.isnan(lo[j]) else 0)
+                if len(vg) >= period:
+                    ag, al = np.mean(vg), np.mean(vl)
+                    rsi[si, di+period-1] = 100 if al==0 else 100-100/(1+ag/al)
                 continue
-            if np.isnan(avg_gain):
-                valid_g = []
-                valid_l = []
-                for j in range(di, min(di + period, ND)):
-                    if not np.isnan(gains[j]):
-                        valid_g.append(gains[j])
-                        valid_l.append(
-                            losses[j] if not np.isnan(losses[j]) else 0.0)
-                if len(valid_g) >= period:
-                    avg_gain = np.mean(valid_g)
-                    avg_loss = np.mean(valid_l)
-                    if avg_loss == 0:
-                        rsi[si, di + period - 1] = 100.0
-                    else:
-                        rs = avg_gain / avg_loss
-                        rsi[si, di + period - 1] = (
-                            100.0 - 100.0 / (1.0 + rs))
-                continue
-
-            avg_gain = (avg_gain * (period - 1) + gains[di]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[di]) / period
-            if avg_loss == 0:
-                rsi[si, di] = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi[si, di] = 100.0 - 100.0 / (1.0 + rs)
+            ag = (ag*(period-1)+g[di])/period
+            al = (al*(period-1)+lo[di])/period
+            rsi[si, di] = 100 if al==0 else 100-100/(1+ag/al)
     return rsi
 
 
-def compute_raw_factors(
-    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
-    V: np.ndarray, OI: np.ndarray, NS: int, ND: int,
-) -> Dict[str, np.ndarray]:
-    """Compute 7 raw factors for NW regression features."""
+def compute_raw_factors(C, O, H, L, V, OI, NS, ND):
     t0 = time.time()
     print("[V114] Computing raw factors...", flush=True)
+    F = {k: np.full((NS,ND),np.nan) for k in [
+        "ret_5d","oi_5d","vol_5d","range_5d","atrp_5d","ret_10d","rsi14",
+        "fwd_ret_5d","atr_mean"]}
 
-    ret_5d = np.full((NS, ND), np.nan)
     for si in range(NS):
         for di in range(5, ND):
-            if (not np.isnan(C[si, di])
-                    and not np.isnan(C[si, di - 5])
-                    and C[si, di - 5] > 0):
-                ret_5d[si, di] = C[si, di] / C[si, di - 5] - 1.0
+            if not np.isnan(C[si,di]) and not np.isnan(C[si,di-5]) and C[si,di-5]>0:
+                F["ret_5d"][si,di] = C[si,di]/C[si,di-5]-1
+            if not np.isnan(OI[si,di]) and not np.isnan(OI[si,di-5]) and OI[si,di-5]>0:
+                F["oi_5d"][si,di] = OI[si,di]/OI[si,di-5]-1
+            vv = V[si,di-5:di]; vm = vv[~np.isnan(vv)]
+            if len(vm)>=3: F["vol_5d"][si,di] = np.mean(vm)
+            rv = []
+            for j in range(di-5,di):
+                if not np.isnan(H[si,j]) and not np.isnan(L[si,j]) and not np.isnan(C[si,j]) and C[si,j]>0 and H[si,j]>L[si,j]:
+                    rv.append((H[si,j]-L[si,j])/C[si,j])
+            if len(rv)>=3: F["range_5d"][si,di] = np.mean(rv)
 
-    oi_5d = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(5, ND):
-            if (not np.isnan(OI[si, di])
-                    and not np.isnan(OI[si, di - 5])
-                    and OI[si, di - 5] > 0):
-                oi_5d[si, di] = OI[si, di] / OI[si, di - 5] - 1.0
-
-    vol_5d = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(5, ND):
-            vals = V[si, di - 5:di]
-            valid = vals[~np.isnan(vals)]
-            if len(valid) >= 3:
-                vol_5d[si, di] = np.mean(valid)
-
-    range_5d = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(5, ND):
-            rng_vals = []
-            for j in range(di - 5, di):
-                if (not np.isnan(H[si, j]) and not np.isnan(L[si, j])
-                        and not np.isnan(C[si, j]) and C[si, j] > 0
-                        and H[si, j] > L[si, j]):
-                    rng_vals.append((H[si, j] - L[si, j]) / C[si, j])
-            if len(rng_vals) >= 3:
-                range_5d[si, di] = np.mean(rng_vals)
-
-    atrp_5d = np.full((NS, ND), np.nan)
-    for si in range(NS):
         for di in range(6, ND):
-            atr_vals = []
-            for j in range(di - 5, di):
-                hh, ll, cc = H[si, j], L[si, j], C[si, j]
-                if not any(np.isnan([hh, ll, cc])):
-                    prev_c = (
-                        C[si, j - 1]
-                        if j > 0 and not np.isnan(C[si, j - 1])
-                        else cc)
-                    atr_vals.append(
-                        max(hh - ll, abs(hh - prev_c), abs(ll - prev_c)))
-            if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
-                atrp_5d[si, di] = np.mean(atr_vals) / C[si, di]
+            av = []
+            for j in range(di-5,di):
+                hh,ll,cc = H[si,j],L[si,j],C[si,j]
+                if not any(np.isnan([hh,ll,cc])):
+                    pc = C[si,j-1] if j>0 and not np.isnan(C[si,j-1]) else cc
+                    av.append(max(hh-ll,abs(hh-pc),abs(ll-pc)))
+            if av and not np.isnan(C[si,di]) and C[si,di]>0:
+                F["atrp_5d"][si,di] = np.mean(av)/C[si,di]
 
-    ret_10d = np.full((NS, ND), np.nan)
-    for si in range(NS):
         for di in range(10, ND):
-            if (not np.isnan(C[si, di])
-                    and not np.isnan(C[si, di - 10])
-                    and C[si, di - 10] > 0):
-                ret_10d[si, di] = C[si, di] / C[si, di - 10] - 1.0
+            if not np.isnan(C[si,di]) and not np.isnan(C[si,di-10]) and C[si,di-10]>0:
+                F["ret_10d"][si,di] = C[si,di]/C[si,di-10]-1
 
-    rsi14 = np.full((NS, ND), np.nan)
+        for di in range(ND-5):
+            if not np.isnan(C[si,di+5]) and not np.isnan(C[si,di]) and C[si,di]>0:
+                F["fwd_ret_5d"][si,di] = C[si,di+5]/C[si,di]-1
+
+        for di in range(20, ND):
+            av = []
+            for j in range(di-14,di):
+                hh,ll,cc = H[si,j],L[si,j],C[si,j]
+                if not any(np.isnan([hh,ll,cc])):
+                    pc = C[si,j-1] if j>0 and not np.isnan(C[si,j-1]) else cc
+                    av.append(max(hh-ll,abs(hh-pc),abs(ll-pc)))
+            if av and not np.isnan(C[si,di]) and C[si,di]>0:
+                F["atr_mean"][si,di] = np.mean(av)/C[si,di]
+
+    # RSI
     if HAS_TALIB:
         for si in range(NS):
-            c = np.where(np.isnan(C[si]), 0, C[si]).astype(np.float64)
-            nan_mask = np.isnan(C[si])
+            c = np.where(np.isnan(C[si]),0,C[si]).astype(np.float64)
+            nm = np.isnan(C[si])
             try:
                 r = talib.RSI(c, 14)
-                rsi14[si] = np.where(nan_mask, np.nan, r)
-            except Exception:
-                pass
-
-    needs_fallback = np.all(np.isnan(rsi14), axis=1)
-    if needs_fallback.any():
-        rsi_manual = compute_rsi_manual(C, NS, ND, 14)
+                F["rsi14"][si] = np.where(nm, np.nan, r)
+            except: pass
+    fb = np.all(np.isnan(F["rsi14"]), axis=1)
+    if fb.any():
+        rm = compute_rsi_manual(C, NS, ND, 14)
         for si in range(NS):
-            if needs_fallback[si]:
-                rsi14[si] = rsi_manual[si]
+            if fb[si]: F["rsi14"][si] = rm[si]
 
-    fwd_ret_5d = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(ND - 5):
-            if (not np.isnan(C[si, di + 5])
-                    and not np.isnan(C[si, di])
-                    and C[si, di] > 0):
-                fwd_ret_5d[si, di] = C[si, di + 5] / C[si, di] - 1.0
-
-    atr_mean = np.full((NS, ND), np.nan)
-    for si in range(NS):
-        for di in range(20, ND):
-            atr_vals = []
-            for j in range(di - 14, di):
-                hh, ll, cc = H[si, j], L[si, j], C[si, j]
-                if not any(np.isnan([hh, ll, cc])):
-                    prev_c = (
-                        C[si, j - 1]
-                        if j > 0 and not np.isnan(C[si, j - 1])
-                        else cc)
-                    atr_vals.append(
-                        max(hh - ll, abs(hh - prev_c), abs(ll - prev_c)))
-            if atr_vals and not np.isnan(C[si, di]) and C[si, di] > 0:
-                atr_mean[si, di] = np.mean(atr_vals) / C[si, di]
-
-    print(f"  Raw factors done: {time.time() - t0:.1f}s", flush=True)
-    return {
-        "ret_5d": ret_5d, "oi_5d": oi_5d, "vol_5d": vol_5d,
-        "range_5d": range_5d, "atrp_5d": atrp_5d,
-        "ret_10d": ret_10d, "rsi14": rsi14,
-        "fwd_ret_5d": fwd_ret_5d,
-        "atr_mean": atr_mean,
-    }
+    print(f"  Raw factors: {time.time()-t0:.1f}s", flush=True)
+    return F
 
 
-def normalize_factor(
-    factor: np.ndarray, NS: int, ND: int, min_count: int = 10,
-) -> np.ndarray:
-    """Cross-sectional z-score normalization for a factor."""
-    normed = np.full((NS, ND), np.nan)
+def normalize_factor(f, NS, ND, mc=10):
+    n = np.full((NS,ND),np.nan)
     for di in range(ND):
-        vals = factor[:, di]
-        valid = vals[~np.isnan(vals)]
-        if len(valid) < min_count:
-            continue
-        mu = np.mean(valid)
-        sigma = np.std(valid)
-        if sigma < 1e-12:
-            continue
+        v = f[:,di]; ok = v[~np.isnan(v)]
+        if len(ok)<mc: continue
+        mu,sig = np.mean(ok),np.std(ok)
+        if sig<1e-12: continue
         for si in range(NS):
-            if not np.isnan(vals[si]):
-                normed[si, di] = (vals[si] - mu) / sigma
-    return normed
+            if not np.isnan(v[si]): n[si,di] = (v[si]-mu)/sig
+    return n
 
 
-# =====================================================================
-# NW Kernel Regression (from V86, simplified without BMA)
-# =====================================================================
+# =================================================================
+# NW Kernel (V86, no BMA)
+# =================================================================
 
-def compute_nw_predicted_returns(
-    raw_factors: Dict[str, np.ndarray],
-    NS: int, ND: int,
-    training_window: int = 40,
-    kernel_bandwidth: float = 1.0,
-) -> np.ndarray:
-    """Compute NW kernel regression predicted returns (no BMA)."""
+def compute_nw_predicted(F, NS, ND, tw=40, bw=1.0):
     t0 = time.time()
-    print(
-        f"[V114] Computing NW predicted returns "
-        f"(window={training_window}, bw={kernel_bandwidth:.1f})...",
-        flush=True)
+    print(f"[V114] NW prediction (tw={tw}, bw={bw})...", flush=True)
+    N = {fn: normalize_factor(F[fn], NS, ND) for fn in FACTOR_NAMES}
+    fwd = F["fwd_ret_5d"]; atr = F["atr_mean"]
+    pred = np.full((NS,ND),np.nan)
 
-    normed = {}
-    for fname in FACTOR_NAMES:
-        normed[fname] = normalize_factor(raw_factors[fname], NS, ND)
-
-    fwd_ret = raw_factors["fwd_ret_5d"]
-    atr_mean = raw_factors["atr_mean"]
-    predicted = np.full((NS, ND), np.nan)
-
-    MIN_TRAIN = 20
-
-    for di in range(training_window + 10, ND):
-        train_features: List[np.ndarray] = []
-        train_targets: List[float] = []
-
-        start_di = max(10, di - training_window)
-        for tdi in range(start_di, di):
+    for di in range(tw+10, ND):
+        tf, tt = [], []
+        for tdi in range(max(10,di-tw), di):
             for si in range(NS):
-                feat = np.array([
-                    normed[fname][si, tdi] for fname in FACTOR_NAMES
-                ])
-                target = fwd_ret[si, tdi]
-                if np.any(np.isnan(feat)) or np.isnan(target):
-                    continue
-                train_features.append(feat)
-                train_targets.append(target)
-
-        if len(train_features) < MIN_TRAIN:
-            continue
-
-        train_X = np.array(train_features)
-        train_Y = np.array(train_targets)
-
-        feat_std = np.std(train_X, axis=0)
-        feat_std[feat_std < 1e-12] = 1.0
+                fe = np.array([N[fn][si,tdi] for fn in FACTOR_NAMES])
+                tg = fwd[si,tdi]
+                if np.any(np.isnan(fe)) or np.isnan(tg): continue
+                tf.append(fe); tt.append(tg)
+        if len(tf)<20: continue
+        tX, tY = np.array(tf), np.array(tt)
+        fs = np.std(tX,axis=0); fs[fs<1e-12]=1.0
 
         for si in range(NS):
-            query_feat = np.array([
-                normed[fname][si, di] for fname in FACTOR_NAMES
-            ])
-            if np.any(np.isnan(query_feat)):
-                continue
-
-            atr_val = atr_mean[si, di]
-            if np.isnan(atr_val):
-                h = kernel_bandwidth
+            qf = np.array([N[fn][si,di] for fn in FACTOR_NAMES])
+            if np.any(np.isnan(qf)): continue
+            av = atr[si,di]; h = max(bw, 0.1) if np.isnan(av) else max(av*bw, 0.1)
+            dist = np.sqrt(np.sum(((tX-qf)/fs)**2, axis=1))
+            sd = dist/h; w = np.zeros(len(tX))
+            m = sd<=1.0
+            if not np.any(m):
+                mi = np.argmin(dist)
+                if dist[mi]<1e12: w[mi]=1.0; m=np.zeros(len(dist),bool); m[mi]=True
+                else: continue
             else:
-                h = atr_val * kernel_bandwidth
-                h = max(h, 0.1)
-
-            diff = train_X - query_feat[np.newaxis, :]
-            dist = np.sqrt(
-                np.sum((diff / feat_std[np.newaxis, :]) ** 2, axis=1))
-
-            scaled_dist = dist / h
-            weights = np.zeros(len(train_X))
-            mask = scaled_dist <= 1.0
-            if not np.any(mask):
-                min_dist_idx = np.argmin(dist)
-                if dist[min_dist_idx] < 1e12:
-                    weights[min_dist_idx] = 1.0
-                    mask = np.array([False] * len(dist))
-                    mask[min_dist_idx] = True
-                else:
-                    continue
-            else:
-                weights[mask] = 0.75 * (1.0 - scaled_dist[mask] ** 2)
-
-            weight_sum = np.sum(weights)
-            if weight_sum < 1e-12:
-                continue
-
-            predicted[si, di] = np.sum(weights * train_Y) / weight_sum
-
-        if di % 100 == 0:
-            valid_count = np.sum(~np.isnan(predicted[:, di]))
-            print(
-                f"  di={di}/{ND} valid={valid_count}/{NS} "
-                f"train_size={len(train_features)}",
-                flush=True)
-
-    print(f"  NW prediction done: {time.time() - t0:.1f}s", flush=True)
-    return predicted
+                w[m] = 0.75*(1-sd[m]**2)
+            ws = np.sum(w)
+            if ws<1e-12: continue
+            pred[si,di] = np.sum(w*tY)/ws
+        if di%100==0:
+            print(f"  di={di}/{ND} valid={np.sum(~np.isnan(pred[:,di]))}/{NS}", flush=True)
+    print(f"  NW done: {time.time()-t0:.1f}s", flush=True)
+    return pred
 
 
-# =====================================================================
-# Helper functions (from V86/V80)
-# =====================================================================
+# =================================================================
+# Helpers
+# =================================================================
 
-def compute_ker(C: np.ndarray, NS: int, ND: int) -> np.ndarray:
-    """Kaufman efficiency ratio for regime detection."""
-    ker_10 = np.full((NS, ND), np.nan)
+def compute_ker(C, NS, ND):
+    kr = np.full((NS,ND),np.nan)
     for si in range(NS):
-        for di in range(10, ND):
-            closes = C[si, di - 10:di + 1]
-            valid = closes[~np.isnan(closes)]
-            if len(valid) < 10 or valid[0] <= 0:
-                continue
-            net_change = abs(valid[-1] - valid[0])
-            total_change = np.sum(np.abs(np.diff(valid)))
-            if total_change > 1e-10:
-                ker_10[si, di] = net_change / total_change
-
-    ker_regime = np.zeros((NS, ND), dtype=int)
+        for di in range(10,ND):
+            cs = C[si,di-10:di+1]; v = cs[~np.isnan(cs)]
+            if len(v)<10 or v[0]<=0: continue
+            tc = np.sum(np.abs(np.diff(v)))
+            if tc>1e-10: kr[si,di] = abs(v[-1]-v[0])/tc
+    reg = np.zeros((NS,ND),dtype=int)
     for si in range(NS):
         for di in range(ND):
-            if np.isnan(ker_10[si, di]):
-                continue
-            if ker_10[si, di] < 0.15:
-                ker_regime[si, di] = 1
-            elif ker_10[si, di] > 0.3:
-                ker_regime[si, di] = -1
-    return ker_regime
+            if np.isnan(kr[si,di]): continue
+            if kr[si,di]<0.15: reg[si,di]=1
+            elif kr[si,di]>0.3: reg[si,di]=-1
+    return reg
 
 
-def get_dynamic_mode(
-    recent_trades_win: List[int],
-    win_threshold: float,
-    win_rate_window: int,
-) -> str:
-    if len(recent_trades_win) < 5:
-        return "normal"
-    window = recent_trades_win[-win_rate_window:]
-    win_rate = sum(window) / len(window)
-    if win_rate > win_threshold:
-        return "winning"
-    elif win_rate < 0.50:
-        return "losing"
-    return "normal"
+def compute_atr(H,L,C,si,di,sd):
+    av=[]
+    for j in range(max(sd,di-14),di):
+        hh,ll,cc=H[si,j],L[si,j],C[si,j]
+        if not any(np.isnan([hh,ll,cc])): av.append(max(hh-ll,abs(hh-cc),abs(ll-cc)))
+    return np.mean(av) if av else None
 
 
-def get_mode_threshold(
-    mode: str,
-    win_threshold: float,
-    normal_threshold: float,
-    lose_threshold: float,
-) -> float:
-    if mode == "winning":
-        return win_threshold
-    elif mode == "losing":
-        return lose_threshold
-    return normal_threshold
+def compute_port_vol(C,NS,ND,vlb=20):
+    pv = np.full(ND,np.nan)
+    for di in range(vlb+1,ND):
+        dr=[]
+        for dd in range(di-vlb,di):
+            r=[C[si,dd]/C[si,dd-1]-1 for si in range(NS) if not np.isnan(C[si,dd]) and not np.isnan(C[si,dd-1]) and C[si,dd-1]>0]
+            if r: dr.append(np.mean(r))
+        if len(dr)>=vlb//2: pv[di]=np.std(dr)
+    return pv
 
 
-def compute_atr_at(H: np.ndarray, L: np.ndarray, C: np.ndarray,
-                   si: int, di: int, start_di: int) -> Optional[float]:
-    atr_v = []
-    for j in range(max(start_di, di - 14), di):
-        hh, ll, cc = H[si, j], L[si, j], C[si, j]
-        if not any(np.isnan([hh, ll, cc])):
-            atr_v.append(max(hh - ll, abs(hh - cc), abs(ll - cc)))
-    if atr_v:
-        return np.mean(atr_v)
-    return None
-
-
-# =====================================================================
-# Portfolio volatility (from V96)
-# =====================================================================
-
-def compute_portfolio_volatility(
-    C: np.ndarray, NS: int, ND: int,
-    vol_lookback: int = 20,
-) -> np.ndarray:
-    """Rolling portfolio volatility proxy. Returns (ND,) array."""
-    port_vol = np.full(ND, np.nan)
-    for di in range(vol_lookback + 1, ND):
-        daily_rets = []
-        for dd in range(di - vol_lookback, di):
-            rets = []
-            for si in range(NS):
-                if (not np.isnan(C[si, dd])
-                        and not np.isnan(C[si, dd - 1])
-                        and C[si, dd - 1] > 0):
-                    rets.append(C[si, dd] / C[si, dd - 1] - 1.0)
-            if rets:
-                daily_rets.append(np.mean(rets))
-        if len(daily_rets) >= vol_lookback // 2:
-            port_vol[di] = np.std(daily_rets)
-    return port_vol
-
-
-def get_vol_multiplier(
-    port_vol: float,
-    vol_median: float,
-    vol_high_mult: float,
-    vol_low_mult: float,
-    size_reduce: float,
-    size_boost: float,
-) -> float:
-    """Position size multiplier based on volatility regime."""
-    if np.isnan(port_vol) or np.isnan(vol_median) or vol_median < 1e-12:
-        return 1.0
-    ratio = port_vol / vol_median
-    if ratio > vol_high_mult:
-        return size_reduce
-    elif ratio < vol_low_mult:
-        return size_boost
+def vol_mult(pv,vm,vhm,vlm,sr,sb):
+    if np.isnan(pv) or np.isnan(vm) or vm<1e-12: return 1.0
+    r = pv/vm
+    if r>vhm: return sr
+    if r<vlm: return sb
     return 1.0
 
 
-# =====================================================================
-# Backtest with H0 microstructure filter + vol-adaptive sizing
-# =====================================================================
+# =================================================================
+# Backtest V114
+# =================================================================
 
-def backtest_v114(
-    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
-    NS: int, ND: int, dates: np.ndarray, syms: List[str],
-    predicted: np.ndarray,
-    ker_regime: np.ndarray,
-    port_vol: np.ndarray,
-    h0_array: np.ndarray,
-    sector_lookup: Dict[int, str],
-    top_n: int = 2,
-    max_per_sector: int = 2,
-    hold_days: int = 5,
-    win_threshold: float = 0.60,
-    normal_threshold: float = 0.80,
-    lose_threshold: float = 0.90,
-    win_rate_window: int = 15,
-    atr_stop: float = 3.0,
-    vol_high_mult: float = 2.0,
-    vol_low_mult: float = 0.5,
-    size_reduce: float = 0.5,
-    size_boost: float = 1.3,
-    vol_lookback: int = 20,
-    h0_normal_low: float = 0.65,
-    h0_normal_high: float = 0.85,
-    h0_crisis_mult: float = 0.3,
-    h0_extreme_mult: float = 0.5,
-    start_di: int = 60,
-    end_di: Optional[int] = None,
-) -> Tuple[List[dict], float, float]:
-    """Backtest V114: NW kernel + H0 microstructure gate + vol sizing."""
-    if end_di is None:
-        end_di = ND - 1
+def backtest(C,O,H,L,NS,ND,dates,syms,pred,ker,pvol,h0a,slook,
+             tn=2,mps=2,hd=5,atr_s=3.0,vhm=2.0,vlm=0.5,sr=0.5,sb=1.3,
+             h0_nl=0.65,h0_nh=0.85,h0_cr=0.3,h0_ex=0.5,
+             sdi=60,edi=None):
+    if edi is None: edi=ND-1
+    vd = pvol[max(sdi,21):edi]; vv = vd[~np.isnan(vd)]
+    vm = np.median(vv) if len(vv)>10 else 1e-6
+    eq,peak,mdd = CASH0,CASH0,0.0
+    pos=[]; trades=[]; rtw=[]
+    wt,nwt,lt = 0.60,0.80,0.90
 
-    vol_data = port_vol[max(start_di, vol_lookback + 1):end_di]
-    vol_data_valid = vol_data[~np.isnan(vol_data)]
-    vol_median = (
-        np.median(vol_data_valid) if len(vol_data_valid) > 10 else 1e-6)
-
-    equity = CASH0
-    peak = equity
-    max_dd = 0.0
-    positions: List[Tuple[int, int, float, float, float]] = []
-    trades: List[dict] = []
-    recent_trades_win: List[int] = []
-
-    h0_normal_count = 0
-    h0_crisis_count = 0
-    h0_extreme_count = 0
-    h0_mild_count = 0
-
-    for di in range(max(start_di, 1), end_di):
-        d = dates[di]
-        daily_pnl = 0.0
-        new_positions: List[Tuple[int, int, float, float, float]] = []
-
-        mode = get_dynamic_mode(
-            recent_trades_win, win_threshold, win_rate_window)
-
-        # Vol-adaptive sizing multiplier
-        vol_mult = get_vol_multiplier(
-            port_vol[di], vol_median,
-            vol_high_mult, vol_low_mult,
-            size_reduce, size_boost)
-
-        # Exit logic
-        pos_by_si: Dict[int, List] = defaultdict(list)
-        for si, edi, ep, sp, alloc in positions:
-            pos_by_si[si].append((edi, ep, sp, alloc))
-
-        for si, pos_list in pos_by_si.items():
-            c = C[si, di]
-            if np.isnan(c):
-                for edi, ep, sp, alloc in pos_list:
-                    new_positions.append((si, edi, ep, sp, alloc))
-                continue
-
-            earliest_edi = min(p[0] for p in pos_list)
-            hold = di - earliest_edi
-            stopped = any(c < sp for _, _, sp, _ in pos_list)
-
-            if stopped:
-                for edi, ep, sp, alloc in pos_list:
-                    pnl = (c - ep) / ep - COMM
-                    profit = equity * alloc * pnl
-                    daily_pnl += profit
-                    is_win = pnl > 0
-                    trades.append({
-                        "pnl_abs": profit, "pnl_pct": pnl * 100,
-                        "days": di - edi + 1, "di": di,
-                        "year": d.year, "sym": syms[si],
-                        "sector": sector_lookup.get(si, 'OTHER'),
-                        "reason": "stop", "mode": mode[:1].upper(),
-                    })
-                    recent_trades_win.append(1 if is_win else 0)
-            elif hold >= hold_days:
-                for edi, ep, sp, alloc in pos_list:
-                    pnl = (c - ep) / ep - COMM
-                    profit = equity * alloc * pnl
-                    daily_pnl += profit
-                    is_win = pnl > 0
-                    trades.append({
-                        "pnl_abs": profit, "pnl_pct": pnl * 100,
-                        "days": di - edi + 1, "di": di,
-                        "year": d.year, "sym": syms[si],
-                        "sector": sector_lookup.get(si, 'OTHER'),
-                        "reason": "hold", "mode": mode[:1].upper(),
-                    })
-                    recent_trades_win.append(1 if is_win else 0)
-            else:
-                for edi, ep, sp, alloc in pos_list:
-                    new_positions.append((si, edi, ep, sp, alloc))
-
-        positions = new_positions
-        equity += daily_pnl
-        if equity > peak:
-            peak = equity
-        if peak > 0:
-            dd = (peak - equity) / peak * 100
-            if dd > max_dd:
-                max_dd = dd
-        if equity <= 0:
-            break
-
-        # --- ENTRY: select top_n by NW predicted return ---
-        held = {p[0] for p in positions}
-        if len(held) >= top_n:
-            continue
-
-        candidates = []
-        for si in range(NS):
-            if si in held:
-                continue
-            pred = predicted[si, di]
-            if np.isnan(pred):
-                continue
-            if di + 1 >= ND or np.isnan(O[si, di + 1]):
-                continue
-            if ker_regime[si, di] < 0:
-                continue
-            # H0 microstructure filter on entry candidate
-            h0_val = h0_array[si, di]
-            h0_mult = get_h0_multiplier(
-                h0_val, h0_normal_low, h0_normal_high,
-                h0_crisis_mult, h0_extreme_mult)
-            # Skip if H0 indicates severe microstructure breakdown
-            if h0_mult < 0.2:
-                continue
-            candidates.append((pred, si, h0_mult))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: -x[0])
-
-        n_to_take = top_n
-        if mode == "winning":
-            n_to_take = min(top_n + 1, top_n * 2)
-        elif mode == "losing":
-            n_to_take = max(1, top_n - 1)
-
-        sector_counts: Dict[str, int] = defaultdict(int)
-        for si_held in held:
-            sector_counts[sector_lookup.get(si_held, 'OTHER')] += 1
-
-        new_entries = []
-        for pred_val, si, h0_mult_entry in candidates:
-            if len(held) + len(new_entries) >= n_to_take:
-                break
-            if si in held:
-                continue
-            sym_sector = sector_lookup.get(si, 'OTHER')
-            if sector_counts[sym_sector] >= max_per_sector:
-                continue
-            if pred_val <= 0:
-                continue
-            new_entries.append((pred_val, si, sym_sector, h0_mult_entry))
-            sector_counts[sym_sector] += 1
-
-            # Track H0 regime stats
-            h0_val = h0_array[si, di]
-            if np.isnan(h0_val):
-                pass
-            elif h0_normal_low <= h0_val <= h0_normal_high:
-                h0_normal_count += 1
-            elif h0_val < h0_normal_low - 0.1:
-                h0_crisis_count += 1
-            elif h0_val > h0_normal_high + 0.05:
-                h0_extreme_count += 1
-            else:
-                h0_mild_count += 1
-
-        if not new_entries:
-            continue
-
-        num_total = len(positions) + len(new_entries)
-        # Apply vol multiplier to position sizing
-        alloc_per_pos = LEVERAGE / num_total * vol_mult
-
-        updated_positions = []
-        for si, edi, ep, sp, old_alloc in positions:
-            updated_positions.append((si, edi, ep, sp, alloc_per_pos))
-
-        for pred_val, si, sym_sector, h0_mult_entry in new_entries:
-            ep = O[si, di + 1]
-            if np.isnan(ep) or ep <= 0:
-                continue
-            atr = compute_atr_at(H, L, C, si, di, start_di)
-            if atr is None:
-                continue
-            # Apply H0 multiplier to reduce size when microstructure is weak
-            final_alloc = alloc_per_pos * h0_mult_entry
-            updated_positions.append(
-                (si, di + 1, ep, ep - atr_stop * atr, final_alloc))
-
-        positions = updated_positions
-
-    # Close remaining positions
-    for si, edi, ep, sp, alloc in positions:
-        c = C[si, ND - 1]
-        if not np.isnan(c) and c > 0:
-            pnl = (c - ep) / ep - COMM
-            equity += equity * alloc * pnl
-
-    h0_info = (
-        f"h0_regime=[normal:{h0_normal_count} crisis:{h0_crisis_count} "
-        f"extreme:{h0_extreme_count} mild:{h0_mild_count}]")
-    if trades:
-        trades[0]["h0_info"] = h0_info
-
-    return trades, equity, max_dd
-
-
-def analyze(trades: List[dict], equity: float, max_dd: float,
-            label: str = "") -> Optional[dict]:
-    if not trades:
-        print(f"  {label}: no trades")
-        return None
-
-    nw = sum(1 for t in trades if t["pnl_pct"] > 0)
-    wr = nw / len(trades) * 100
-    n_days = max(1, trades[-1]["di"] - trades[0]["di"])
-    ann = ((equity / CASH0) ** (1 / max(1.0, n_days / 252)) - 1) * 100
-    ap = [t["pnl_abs"] for t in sorted(trades, key=lambda x: x["di"])]
-    rets = np.array(ap) / CASH0
-    sh = (np.mean(rets) / np.std(rets) * np.sqrt(252)
-          if np.std(rets) > 0 else 0)
-
-    n_stop = sum(1 for t in trades if t["reason"] == "stop")
-    n_hold = sum(1 for t in trades if t["reason"] == "hold")
-
-    mode_counts = {"W": 0, "N": 0, "L": 0}
-    for t in trades:
-        m = t.get("mode", "N")
-        if m in mode_counts:
-            mode_counts[m] += 1
-
-    sector_counts: Dict[str, int] = defaultdict(int)
-    for t in trades:
-        sector_counts[t.get("sector", "OTHER")] += 1
-    sector_str = " ".join(
-        f"{k}:{v}" for k, v in sorted(sector_counts.items()))
-
-    avg_pnl = np.mean([t["pnl_pct"] for t in trades])
-    avg_win = np.mean([t["pnl_pct"] for t in trades if t["pnl_pct"] > 0])
-    avg_loss = np.mean([t["pnl_pct"] for t in trades if t["pnl_pct"] <= 0])
-
-    print(
-        f"  {label}: {len(trades)}t (stop:{n_stop} hold:{n_hold}) "
-        f"WR={wr:.1f}% ann={ann:+.1f}% DD={max_dd:.1f}% "
-        f"Sh={sh:.2f} eq={equity:,.0f}")
-    print(
-        f"    avg_pnl={avg_pnl:+.3f}% avg_win={avg_win:+.3f}% "
-        f"avg_loss={avg_loss:+.3f}% "
-        f"modes=[W:{mode_counts['W']} N:{mode_counts['N']} "
-        f"L:{mode_counts['L']}]")
-    print(f"    sectors: {sector_str}")
-
-    yr: Dict[int, dict] = {}
-    for t in trades:
-        y = t["year"]
-        if y not in yr:
-            yr[y] = {"n": 0, "w": 0, "pnl": []}
-        yr[y]["n"] += 1
-        if t["pnl_pct"] > 0:
-            yr[y]["w"] += 1
-        yr[y]["pnl"].append(t["pnl_pct"])
-    for y in sorted(yr.keys()):
-        ys = yr[y]
-        cum = np.prod([1 + p / 100 for p in ys["pnl"]]) - 1
-        print(
-            f"    {y}: {ys['n']}t WR={ys['w']/ys['n']*100:.1f}% "
-            f"cum={cum:+.1%}")
-
-    return {
-        "n": len(trades), "wr": wr, "dd": max_dd,
-        "ann": ann, "sh": sh, "eq": equity,
-    }
-
-
-def walk_forward(
-    C: np.ndarray, O: np.ndarray, H: np.ndarray, L: np.ndarray,
-    NS: int, ND: int, dates: np.ndarray, syms: List[str],
-    predicted: np.ndarray,
-    ker_regime: np.ndarray,
-    port_vol: np.ndarray,
-    h0_array: np.ndarray,
-    sector_lookup: Dict[int, str],
-    top_n: int = 2,
-    max_per_sector: int = 2,
-    hold_days: int = 5,
-    vol_high_mult: float = 2.0,
-    vol_low_mult: float = 0.5,
-    size_reduce: float = 0.5,
-    size_boost: float = 1.3,
-    vol_lookback: int = 20,
-    h0_normal_low: float = 0.65,
-    h0_normal_high: float = 0.85,
-    h0_crisis_mult: float = 0.3,
-    h0_extreme_mult: float = 0.5,
-    label: str = "",
-) -> List[dict]:
-    cfg_str = (
-        f"tn={top_n} mps={max_per_sector} hd={hold_days} "
-        f"h0=[{h0_normal_low:.2f}-{h0_normal_high:.2f}] "
-        f"crisis={h0_crisis_mult:.1f} extreme={h0_extreme_mult:.1f}")
-    print(f"\n{'=' * 70}")
-    print(f"  WALK-FORWARD V114 {label}")
-    print(f"  {cfg_str}")
-    print(f"  NO LEVERAGE (leverage=1.0)")
-    print(f"{'=' * 70}")
-
-    years = sorted(set(d.year for d in dates))
-    all_trades: List[dict] = []
-
-    for test_year in range(2019, years[-1] + 1):
-        test_start = None
-        test_end_idx = None
-        for i, d in enumerate(dates):
-            if d.year == test_year and test_start is None:
-                test_start = i
-            if d.year == test_year:
-                test_end_idx = i
-        if test_start is None:
-            continue
-
-        trades, _, _ = backtest_v114(
-            C, O, H, L, NS, ND, dates, syms,
-            predicted, ker_regime, port_vol, h0_array,
-            sector_lookup=sector_lookup,
-            top_n=top_n,
-            max_per_sector=max_per_sector,
-            hold_days=hold_days,
-            vol_high_mult=vol_high_mult,
-            vol_low_mult=vol_low_mult,
-            size_reduce=size_reduce,
-            size_boost=size_boost,
-            vol_lookback=vol_lookback,
-            h0_normal_low=h0_normal_low,
-            h0_normal_high=h0_normal_high,
-            h0_crisis_mult=h0_crisis_mult,
-            h0_extreme_mult=h0_extreme_mult,
-            start_di=test_start,
-            end_di=test_end_idx + 1,
-        )
-
-        test_trades = [t for t in trades
-                       if dates[t["di"]].year == test_year]
-        all_trades.extend(test_trades)
-
-        if test_trades:
-            n = len(test_trades)
-            nw = sum(1 for t in test_trades if t["pnl_pct"] > 0)
-            wr_val = nw / n * 100
-            avg = np.mean([t["pnl_pct"] for t in test_trades])
-            yr_sectors: Dict[str, int] = defaultdict(int)
-            for t in test_trades:
-                yr_sectors[t.get("sector", "OTHER")] += 1
-            sec_str = " ".join(
-                f"{k}:{v}" for k, v in sorted(yr_sectors.items()))
-            print(
-                f"  {test_year}: {n}t WR={wr_val:.1f}% avg={avg:+.2f}% "
-                f"sectors=[{sec_str}]",
-                flush=True)
+    for di in range(max(sdi,1),edi):
+        d=dates[di]; dpnl=0.0; npos=[]
+        # mode
+        if len(rtw)<5: mode="normal"
         else:
-            print(f"  {test_year}: no trades", flush=True)
+            wr = sum(rtw[-15:])/len(rtw[-15:])
+            mode = "winning" if wr>wt else ("losing" if wr<0.50 else "normal")
+        vm2 = vol_mult(pvol[di],vm,vhm,vlm,sr,sb)
 
-    if all_trades:
-        nw = sum(1 for t in all_trades if t["pnl_pct"] > 0)
-        wr_val = nw / len(all_trades) * 100
-        avg = np.mean([t["pnl_pct"] for t in all_trades])
-        cum = np.prod(
-            [1 + t["pnl_pct"] / 100 for t in all_trades]) - 1
-        agg_sectors: Dict[str, int] = defaultdict(int)
-        for t in all_trades:
-            agg_sectors[t.get("sector", "OTHER")] += 1
-        sec_str = " ".join(
-            f"{k}:{v}" for k, v in sorted(agg_sectors.items()))
-        print(
-            f"\n  WF TOTAL: {len(all_trades)}t "
-            f"WR={wr_val:.1f}% avg={avg:+.2f}% cum={cum:+.1%}")
-        print(f"  WF SECTORS: {sec_str}")
-        return all_trades
-    return []
+        # exits
+        pbs = defaultdict(list)
+        for si,edi2,ep,sp,al in pos: pbs[si].append((edi2,ep,sp,al))
+        for si,pl in pbs.items():
+            c=C[si,di]
+            if np.isnan(c):
+                for e,s,sp,al in pl: npos.append((si,e,s,sp,al))
+                continue
+            ee=min(p[0] for p in pl); hold=di-ee; stopped=any(c<p[2] for p in pl)
+            if stopped or hold>=hd:
+                for e,s,sp,al in pl:
+                    pnl=(c-s)/s-COMM; pr=eq*al*pnl; dpnl+=pr
+                    trades.append({"pnl_abs":pr,"pnl_pct":pnl*100,"days":di-e+1,"di":di,"year":d.year,"sym":syms[si],"sector":slook.get(si,'OTHER')})
+                    rtw.append(1 if pnl>0 else 0)
+            else:
+                for e,s,sp,al in pl: npos.append((si,e,s,sp,al))
+        pos=npos; eq+=dpnl
+        if eq>peak: peak=eq
+        if peak>0:
+            dd=(peak-eq)/peak*100
+            if dd>mdd: mdd=dd
+        if eq<=0: break
+
+        # entry
+        held={p[0] for p in pos}
+        if len(held)>=tn: continue
+        cands=[]
+        for si in range(NS):
+            if si in held: continue
+            p=pred[si,di]
+            if np.isnan(p): continue
+            if di+1>=ND or np.isnan(O[si,di+1]): continue
+            if ker[si,di]<0: continue
+            hm=get_h0_mult(h0a[si,di],h0_nl,h0_nh,h0_cr,h0_ex)
+            if hm<0.2: continue
+            cands.append((p,si,hm))
+        if not cands: continue
+        cands.sort(key=lambda x:-x[0])
+        nt = min(tn+1,tn*2) if mode=="winning" else (max(1,tn-1) if mode=="losing" else tn)
+        sc=defaultdict(int)
+        for sh in held: sc[slook.get(sh,'OTHER')]+=1
+        ne=[]
+        for pv2,si,hm in cands:
+            if len(held)+len(ne)>=nt: break
+            if si in held: continue
+            ss=slook.get(si,'OTHER')
+            if sc[ss]>=mps: continue
+            if pv2<=0: continue
+            ne.append((pv2,si,ss,hm)); sc[ss]+=1
+        if not ne: continue
+        ap = LEVERAGE/(len(pos)+len(ne))*vm2
+        upos=[(si,e,s,sp,ap) for si,e,s,sp,al in pos]
+        for pv2,si,ss,hm in ne:
+            ep=O[si,di+1]
+            if np.isnan(ep) or ep<=0: continue
+            a=compute_atr(H,L,C,si,di,sdi)
+            if a is None: continue
+            upos.append((si,di+1,ep,ep-atr_s*a,ap*hm))
+        pos=upos
+
+    for si,edi2,ep,sp,al in pos:
+        c=C[si,ND-1]
+        if not np.isnan(c) and c>0: eq+=eq*al*((c-ep)/ep-COMM)
+    return trades,eq,mdd
 
 
-def main() -> None:
-    t0 = time.time()
-    print("=" * 70)
+def analyze(trades,eq,mdd,label=""):
+    if not trades: print(f"  {label}: no trades"); return None
+    nw=sum(1 for t in trades if t["pnl_pct"]>0)
+    wr=nw/len(trades)*100
+    nd=max(1,trades[-1]["di"]-trades[0]["di"])
+    ann=((eq/CASH0)**(1/max(1.0,nd/252))-1)*100
+    ap=[t["pnl_abs"] for t in sorted(trades,key=lambda x:x["di"])]
+    rets=np.array(ap)/CASH0
+    sh=np.mean(rets)/np.std(rets)*np.sqrt(252) if np.std(rets)>0 else 0
+    ns=sum(1 for t in trades if t.get("reason","")=="stop")
+    print(f"  {label}: {len(trades)}t WR={wr:.1f}% ann={ann:+.1f}% DD={mdd:.1f}% Sh={sh:.2f} eq={eq:,.0f}")
+    yr={}
+    for t in trades:
+        y=t["year"]
+        if y not in yr: yr[y]={"n":0,"w":0,"p":[]}
+        yr[y]["n"]+=1
+        if t["pnl_pct"]>0: yr[y]["w"]+=1
+        yr[y]["p"].append(t["pnl_pct"])
+    for y in sorted(yr):
+        ys=yr[y]; cum=np.prod([1+p/100 for p in ys["p"]])-1
+        print(f"    {y}: {ys['n']}t WR={ys['w']/ys['n']*100:.1f}% cum={cum:+.1%}")
+    return {"n":len(trades),"wr":wr,"dd":mdd,"ann":ann,"sh":sh,"eq":eq}
+
+
+# =================================================================
+# Main
+# =================================================================
+
+def main():
+    t0=time.time()
+    print("="*70)
     print("  V114: H0 MICROSTRUCTURE QUALITY FILTER + NW KERNEL")
-    print("  Innovation: Hurst exponent H0 as leading microstructure gate")
-    print("  Paper 2601.23172: H0 ~0.75 unifies order flow, vol roughness")
-    print("  When H0 deviates, signals unreliable -- reduce position size")
-    print("  Walk-forward 2019-2026. No leverage.")
-    print("=" * 70)
+    print("  Paper 2601.23172: H0~0.75 unifies order flow, vol roughness")
+    print("  Walk-forward 2019-2026. LEVERAGE=1.0, CASH0=1M, COMM=0.0005")
+    print("="*70)
 
-    C, O, H, L, V, OI, NS, ND, dates, syms = load_all_data(
-        start="2016-01-01")
-    print(
-        f"  {NS} sym, {ND} days, "
-        f"{dates[0].strftime('%Y-%m-%d')} to "
-        f"{dates[-1].strftime('%Y-%m-%d')}")
+    C,O,H,L,V,OI,NS,ND,dates,syms = load_all_data(start="2016-01-01")
+    print(f"  {NS} sym, {ND} days, {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')}")
+    slook = build_sector_lookup(syms)
+    sd = defaultdict(int)
+    for s in slook.values(): sd[s]+=1
+    print(f"  Sectors: {dict(sd)}")
+    bt19 = next(i for i,d in enumerate(dates) if d>=pd.Timestamp("2019-01-01"))
 
-    sector_lookup = build_sector_lookup(syms)
-    sector_dist: Dict[str, int] = defaultdict(int)
-    for sec in sector_lookup.values():
-        sector_dist[sec] += 1
-    print(f"  Sector distribution: {dict(sector_dist)}")
+    # 1. Factors + NW prediction
+    F = compute_raw_factors(C,O,H,L,V,OI,NS,ND)
+    ker = compute_ker(C,NS,ND)
+    pred = compute_nw_predicted(F,NS,ND,tw=40,bw=1.0)
+    pvol = compute_port_vol(C,NS,ND,20)
 
-    bt_2019 = None
-    for i, d in enumerate(dates):
-        if d >= pd.Timestamp("2019-01-01"):
-            bt_2019 = i
-            break
+    # 2. H0 estimation
+    print("\n[V114] Signed volume delta...", flush=True)
+    svd = compute_signed_volume_delta(C,H,L,V,NS,ND)
+    h0c = {}
+    for w in [60,80,100]:
+        print(f"[V114] H0 estimation (w={w})...", flush=True)
+        th=time.time()
+        h0c[w] = estimate_h0_rs(svd,NS,ND,h0_window=w)
+        hv = h0c[w].flatten(); hv = hv[~np.isnan(hv)]
+        if len(hv)>0:
+            print(f"  H0-z(w={w}): mean={np.mean(hv):.3f} med={np.median(hv):.3f} "
+                  f"std={np.std(hv):.3f} "
+                  f"p5={np.percentile(hv,5):.3f} p95={np.percentile(hv,95):.3f} "
+                  f"in[-1,1]={np.sum((hv>=-1)&(hv<=1))/len(hv)*100:.1f}% "
+                  f"lt-2={np.sum(hv<-2)/len(hv)*100:.1f}% gt+2={np.sum(hv>2)/len(hv)*100:.1f}% "
+                  f"{time.time()-th:.1f}s", flush=True)
 
-    # === 1. Compute raw factors ===
-    raw_factors = compute_raw_factors(C, O, H, L, V, OI, NS, ND)
-    ker_regime = compute_ker(C, NS, ND)
-
-    # === 2. Compute NW predicted returns (no BMA) ===
-    predicted = compute_nw_predicted_returns(
-        raw_factors, NS, ND,
-        training_window=40,
-        kernel_bandwidth=1.0,
-    )
-
-    # === 3. Compute H0 estimates for each window ===
-    print("\n[V114] Computing signed volume delta...", flush=True)
-    signed_vd = compute_signed_volume_delta(C, H, L, V, NS, ND)
-
-    h0_cache: Dict[int, np.ndarray] = {}
-    for h0w in [60, 80, 100]:
-        print(f"\n[V114] Estimating H0 (window={h0w})...", flush=True)
-        t_h0 = time.time()
-        h0_cache[h0w] = estimate_h0_rs(signed_vd, NS, ND, h0_window=h0w)
-
-        # Quick H0 distribution stats
-        h0_vals = h0_cache[h0w].flatten()
-        h0_valid = h0_vals[~np.isnan(h0_vals)]
-        if len(h0_valid) > 0:
-            print(
-                f"  H0 (w={h0w}): mean={np.mean(h0_valid):.3f} "
-                f"median={np.median(h0_valid):.3f} "
-                f"std={np.std(h0_valid):.3f} "
-                f"in [0.65,0.85]={np.sum((h0_valid>=0.65)&(h0_valid<=0.85))/len(h0_valid)*100:.1f}% "
-                f"done: {time.time()-t_h0:.1f}s",
-                flush=True)
-
-    # === 4. Compute portfolio volatility ===
-    vol_cache: Dict[int, np.ndarray] = {}
-    for vlb in [20]:
-        vol_cache[vlb] = compute_portfolio_volatility(C, NS, ND, vlb)
-
-    # === 5. Parameter sweep ===
-    print("\n" + "=" * 70)
+    # 3. Parameter sweep
+    print("\n"+"="*70)
     print("  PARAMETER SWEEP (2019-2026)")
-    print("  H0 microstructure filter + NW kernel + vol-adaptive sizing")
-    print("  NO LEVERAGE.")
-    print("=" * 70)
+    print("="*70)
+    results = []; sc = 0
+    for h0w in [60,80,100]:
+        ha = h0c[h0w]
+        for tn in [2]:
+            for mps in [2,3]:
+                for nl in [-1.5,-1.0,-0.5]:
+                    for nh in [0.5,1.0,1.5]:
+                        for cr in [0.2,0.3,0.5]:
+                            for ex in [0.4,0.5,0.6]:
+                                sc += 1
+                                tr,eq,dd = backtest(C,O,H,L,NS,ND,dates,syms,
+                                    pred,ker,pvol,ha,slook,tn=tn,mps=mps,
+                                    h0_nl=nl,h0_nh=nh,h0_cr=cr,h0_ex=ex,sdi=bt19)
+                                if len(tr)<10: continue
+                                nw=sum(1 for t in tr if t["pnl_pct"]>0)
+                                wr=nw/len(tr)*100
+                                nd2=max(1,tr[-1]["di"]-tr[0]["di"])
+                                ann=((eq/CASH0)**(1/max(1.0,nd2/252))-1)*100
+                                ap2=[t["pnl_abs"] for t in sorted(tr,key=lambda x:x["di"])]
+                                ra=np.array(ap2)/CASH0
+                                sv2=np.mean(ra)/np.std(ra)*np.sqrt(252) if np.std(ra)>0 else 0
+                                results.append({"h0w":h0w,"tn":tn,"mps":mps,
+                                    "nl":nl,"nh":nh,"cr":cr,"ex":ex,
+                                    "n":len(tr),"wr":wr,"ann":ann,"dd":dd,"sh":sv2,"eq":eq})
 
-    results: List[dict] = []
-    sweep_count = 0
-
-    for h0w in [60, 80, 100]:
-        h0_arr = h0_cache[h0w]
-        for top_n in [2]:
-            for mps in [2, 3]:
-                for h0_nl in [0.60, 0.65, 0.70]:
-                    for h0_nh in [0.80, 0.85, 0.90]:
-                        for h0_cr in [0.2, 0.3, 0.5]:
-                            for h0_ex in [0.4, 0.5, 0.6]:
-                                sweep_count += 1
-                                trades, eq, dd = backtest_v114(
-                                    C, O, H, L, NS, ND,
-                                    dates, syms,
-                                    predicted, ker_regime,
-                                    vol_cache[20], h0_arr,
-                                    sector_lookup=sector_lookup,
-                                    top_n=top_n,
-                                    max_per_sector=mps,
-                                    hold_days=5,
-                                    h0_normal_low=h0_nl,
-                                    h0_normal_high=h0_nh,
-                                    h0_crisis_mult=h0_cr,
-                                    h0_extreme_mult=h0_ex,
-                                    start_di=bt_2019,
-                                )
-
-                                if len(trades) < 10:
-                                    continue
-
-                                nw = sum(
-                                    1 for t in trades
-                                    if t["pnl_pct"] > 0)
-                                wr = nw / len(trades) * 100
-                                n_days = max(
-                                    1,
-                                    trades[-1]["di"] - trades[0]["di"])
-                                ann = ((eq / CASH0) ** (
-                                    1 / max(
-                                        1.0, n_days / 252)) - 1) * 100
-                                ap = [t["pnl_abs"]
-                                      for t in sorted(
-                                          trades,
-                                          key=lambda x: x["di"])]
-                                rets_arr = np.array(ap) / CASH0
-                                sh_val = (
-                                    np.mean(rets_arr)
-                                    / np.std(rets_arr) * np.sqrt(252)
-                                    if np.std(rets_arr) > 0 else 0)
-
-                                results.append({
-                                    "h0w": h0w, "top_n": top_n,
-                                    "mps": mps,
-                                    "h0_nl": h0_nl, "h0_nh": h0_nh,
-                                    "h0_cr": h0_cr, "h0_ex": h0_ex,
-                                    "n": len(trades), "wr": wr,
-                                    "ann": ann, "dd": dd,
-                                    "sharpe": sh_val, "eq": eq,
-                                })
-
-    results.sort(key=lambda x: -x["ann"])
-    print(
-        f"\n  Evaluated {sweep_count} configs, "
-        f"{len(results)} with 10+ trades")
-
+    results.sort(key=lambda x:-x["ann"])
+    print(f"\n  Evaluated {sc} configs, {len(results)} with 10+ trades")
     if results:
-        print(
-            f"\n{'H0w':>4} {'TN':>3} {'MPS':>3} "
-            f"{'H0lo':>5} {'H0hi':>5} {'H0cr':>5} {'H0ex':>5} "
-            f"{'N':>5} {'WR':>6} {'Ann':>9} {'DD':>7} "
-            f"{'Sh':>7}")
-        print("-" * 95)
+        print(f"\n{'H0w':>4} {'TN':>3} {'MPS':>3} {'H0lo':>5} {'H0hi':>5} "
+              f"{'H0cr':>5} {'H0ex':>5} {'N':>5} {'WR':>6} {'Ann':>9} {'DD':>7} {'Sh':>7}")
+        print("-"*95)
         for r in results[:15]:
-            print(
-                f"{r['h0w']:>4} {r['top_n']:>3} {r['mps']:>3} "
-                f"{r['h0_nl']:>5.2f} {r['h0_nh']:>5.2f} "
-                f"{r['h0_cr']:>5.1f} {r['h0_ex']:>5.1f} "
-                f"{r['n']:>5} {r['wr']:>5.1f}% {r['ann']:>+8.1f}% "
-                f"{r['dd']:>6.1f}% {r['sharpe']:>6.2f}")
+            print(f"{r['h0w']:>4} {r['tn']:>3} {r['mps']:>3} "
+                  f"{r['nl']:>5.2f} {r['nh']:>5.2f} {r['cr']:>5.1f} {r['ex']:>5.1f} "
+                  f"{r['n']:>5} {r['wr']:>5.1f}% {r['ann']:>+8.1f}% {r['dd']:>6.1f}% {r['sh']:>6.2f}")
     else:
-        print("  No configs with 10+ trades. Exiting.")
-        return
+        print("  No configs with 10+ trades."); return
 
-    # === 6. Walk-forward for top configs ===
-    best_by_sharpe = max(results, key=lambda x: x["sharpe"])
-    best_by_ann = results[0]
-    best_risk_adj = max(
-        results,
-        key=lambda x: x["ann"] / max(x["dd"], 1.0))
+    # 4. Walk-forward for top configs
+    ba = results[0]
+    bs = max(results, key=lambda x: x["sh"])
+    br = max(results, key=lambda x: x["ann"]/max(x["dd"],1))
+    for lbl, best in [("BEST-ANN",ba),("BEST-SHARPE",bs),("BEST-RISK-ADJ",br)]:
+        print(f"\n{'='*70}\n  WF V114 {lbl}: h0w={best['h0w']} nl={best['nl']} nh={best['nh']} "
+              f"cr={best['cr']} ex={best['ex']} tn={best['tn']} mps={best['mps']}\n{'='*70}")
+        yrs = sorted(set(d.year for d in dates))
+        at = []
+        for ty in range(2019, yrs[-1]+1):
+            ts=te=None
+            for i,d in enumerate(dates):
+                if d.year==ty and ts is None: ts=i
+                if d.year==ty: te=i
+            if ts is None: continue
+            tr,_,_ = backtest(C,O,H,L,NS,ND,dates,syms,pred,ker,pvol,
+                h0c[best["h0w"]],slook,tn=best["tn"],mps=best["mps"],
+                h0_nl=best["nl"],h0_nh=best["nh"],h0_cr=best["cr"],h0_ex=best["ex"],
+                sdi=ts,edi=te+1)
+            yt=[t for t in tr if dates[t["di"]].year==ty]
+            at.extend(yt)
+            if yt:
+                nw=sum(1 for t in yt if t["pnl_pct"]>0)
+                print(f"  {ty}: {len(yt)}t WR={nw/len(yt)*100:.1f}% avg={np.mean([t['pnl_pct'] for t in yt]):+.2f}%", flush=True)
+            else:
+                print(f"  {ty}: no trades", flush=True)
+        if at:
+            nw=sum(1 for t in at if t["pnl_pct"]>0)
+            cum=np.prod([1+t["pnl_pct"]/100 for t in at])-1
+            print(f"\n  WF TOTAL: {len(at)}t WR={nw/len(at)*100:.1f}% cum={cum:+.1%}")
 
-    for label, best in [
-        ("BEST-ANN", best_by_ann),
-        ("BEST-SHARPE", best_by_sharpe),
-        ("BEST-RISK-ADJ", best_risk_adj),
-    ]:
-        walk_forward(
-            C, O, H, L, NS, ND, dates, syms,
-            predicted, ker_regime,
-            vol_cache[20],
-            h0_cache[best["h0w"]],
-            sector_lookup=sector_lookup,
-            top_n=best["top_n"],
-            max_per_sector=best["mps"],
-            hold_days=5,
-            h0_normal_low=best["h0_nl"],
-            h0_normal_high=best["h0_nh"],
-            h0_crisis_mult=best["h0_cr"],
-            h0_extreme_mult=best["h0_ex"],
-            label=label,
-        )
-
-    # === 7. Compare V114 (best) vs V96 baseline (no H0 filter) ===
-    print("\n" + "=" * 70)
-    print("  COMPARISON: V114 (H0 filter) vs V96 baseline (no H0)")
-    print("  (2019-2026 OOS)")
-    print("=" * 70)
-
-    # V114 best
-    best = best_by_ann
-    trades_v114, eq_v114, dd_v114 = backtest_v114(
-        C, O, H, L, NS, ND, dates, syms,
-        predicted, ker_regime,
-        vol_cache[20],
-        h0_cache[best["h0w"]],
-        sector_lookup=sector_lookup,
-        top_n=best["top_n"],
-        max_per_sector=best["mps"],
-        hold_days=5,
-        h0_normal_low=best["h0_nl"],
-        h0_normal_high=best["h0_nh"],
-        h0_crisis_mult=best["h0_cr"],
-        h0_extreme_mult=best["h0_ex"],
-        start_di=bt_2019,
-    )
-
-    # V96 baseline: H0 filter disabled (normal range very wide)
-    trades_v96, eq_v96, dd_v96 = backtest_v114(
-        C, O, H, L, NS, ND, dates, syms,
-        predicted, ker_regime,
-        vol_cache[20],
-        h0_cache[best["h0w"]],
-        sector_lookup=sector_lookup,
-        top_n=best["top_n"],
-        max_per_sector=best["mps"],
-        hold_days=5,
-        h0_normal_low=0.01,
-        h0_normal_high=1.50,
-        h0_crisis_mult=1.0,
-        h0_extreme_mult=1.0,
-        start_di=bt_2019,
-    )
-
-    print(f"\n  V114 BEST-ANN (NW + H0 filter):")
-    analyze(trades_v114, eq_v114, dd_v114, "V114-H0")
-    print(f"\n  V96 BASELINE (NW only, no H0 filter):")
-    analyze(trades_v96, eq_v96, dd_v96, "V96-baseline")
-
-    if trades_v114 and trades_v96:
-        print(
-            f"\n  Delta: eq={eq_v114 - eq_v96:+,.0f} "
-            f"dd={dd_v114 - dd_v96:+.1f}% "
-            f"trades={len(trades_v114) - len(trades_v96):+d}")
-
-    print(f"\n[V114] Done. {time.time() - t0:.1f}s")
+    # 5. Compare V114 vs baseline (H0 disabled)
+    print("\n"+"="*70)
+    print("  COMPARISON: V114 (H0 filter) vs baseline (no H0)")
+    print("="*70)
+    best = ba
+    t1,e1,d1 = backtest(C,O,H,L,NS,ND,dates,syms,pred,ker,pvol,
+        h0c[best["h0w"]],slook,tn=best["tn"],mps=best["mps"],
+        h0_nl=best["nl"],h0_nh=best["nh"],h0_cr=best["cr"],h0_ex=best["ex"],sdi=bt19)
+    # baseline: H0 effectively disabled
+    t2,e2,d2 = backtest(C,O,H,L,NS,ND,dates,syms,pred,ker,pvol,
+        h0c[best["h0w"]],slook,tn=best["tn"],mps=best["mps"],
+        h0_nl=0.01,h0_nh=1.50,h0_cr=1.0,h0_ex=1.0,sdi=bt19)
+    print(f"\n  V114 BEST (NW + H0 filter):"); analyze(t1,e1,d1,"V114-H0")
+    print(f"\n  BASELINE (NW only, no H0):"); analyze(t2,e2,d2,"Baseline")
+    if t1 and t2:
+        print(f"\n  Delta: eq={e1-e2:+,.0f} dd={d1-d2:+.1f}% trades={len(t1)-len(t2):+d}")
+    print(f"\n[V114] Done. {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":

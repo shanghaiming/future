@@ -291,10 +291,10 @@ def compute_confidence_score(
     """Compute factor confidence score for each day.
 
     For each factor, compute rolling Spearman IC over confidence_window.
-    confidence_score = mean(|IC_i|) for factors with |IC_i| > ic_threshold.
-    Only "working" factors contribute — if most factors are noisy, score is low.
+    confidence_score = fraction of factors with |IC_i| > ic_threshold.
+    Range [0, 1]: 0 = no factors working, 1 = all factors working.
 
-    Returns (ND,) array of confidence scores.
+    Returns (ND,) array of confidence scores in [0, 1].
     """
     t0 = time.time()
     print(
@@ -306,12 +306,11 @@ def compute_confidence_score(
     confidence = np.full(ND, np.nan)
 
     for di in range(confidence_window + 5, ND):
-        active_ic_magnitudes: List[float] = []
+        n_active = 0
 
         for fname in FACTOR_NAMES:
             factor = raw_factors[fname]
             ic_vals = []
-            fwd_vals = []
 
             for tdi in range(di - confidence_window, di):
                 f_day = factor[:, tdi]
@@ -325,43 +324,40 @@ def compute_confidence_score(
                     corr = np.corrcoef(f_rank, r_rank)[0, 1]
                     if not np.isnan(corr):
                         ic_vals.append(corr)
-                        fwd_vals.append(corr)
 
             if len(ic_vals) >= 3:
                 mean_ic = np.mean(ic_vals)
                 if abs(mean_ic) > ic_threshold:
-                    active_ic_magnitudes.append(abs(mean_ic))
+                    n_active += 1
 
-        if active_ic_magnitudes:
-            confidence[di] = np.mean(active_ic_magnitudes)
-        else:
-            confidence[di] = 0.0
+        confidence[di] = n_active / N_FACTORS
 
         if di % 200 == 0:
-            valid_score = confidence[di]
-            n_active = len(active_ic_magnitudes)
             print(
-                f"  di={di}/{ND} score={valid_score:.4f} "
-                f"active_factors={n_active}/{N_FACTORS}",
+                f"  di={di}/{ND} active_frac={confidence[di]:.3f} "
+                f"active={n_active}/{N_FACTORS}",
                 flush=True)
 
     valid_scores = confidence[~np.isnan(confidence)]
     if len(valid_scores) > 0:
         print(
-            f"  Confidence done: mean={np.mean(valid_scores):.4f} "
-            f"median={np.median(valid_scores):.4f} "
+            f"  Confidence done: mean={np.mean(valid_scores):.3f} "
+            f"median={np.median(valid_scores):.3f} "
+            f"p10={np.percentile(valid_scores, 10):.3f} "
+            f"p90={np.percentile(valid_scores, 90):.3f} "
             f"{time.time() - t0:.1f}s", flush=True)
     return confidence
 
 
 def get_confidence_multiplier(
     confidence_score: float,
-    confidence_threshold: float = 0.03,
-    confidence_high: float = 0.06,
+    confidence_threshold: float = 0.4,
+    confidence_high: float = 0.7,
     confidence_low_mult: float = 0.5,
 ) -> float:
     """Get position size multiplier based on factor confidence.
 
+    confidence_score is fraction of factors with significant IC (0 to 1).
     - Low confidence (< threshold): reduce by confidence_low_mult
     - High confidence (> high_threshold): normal 1.0x
     - In between: linear interpolation
@@ -372,10 +368,9 @@ def get_confidence_multiplier(
         return confidence_low_mult
     if confidence_score > confidence_high:
         return 1.0
-    # Linear interpolation between threshold and high
     fraction = (
         (confidence_score - confidence_threshold)
-        / (confidence_high - confidence_threshold)
+        / max(confidence_high - confidence_threshold, 1e-6)
     )
     return confidence_low_mult + fraction * (1.0 - confidence_low_mult)
 
@@ -985,8 +980,8 @@ def main() -> None:
         conf = confidence_cache[cw]
         for top_n in [2]:
             for mps in [2, 3]:
-                for ct in [0.02, 0.03, 0.04]:
-                    for ch in [0.05, 0.06, 0.07]:
+                for ct in [0.3, 0.4, 0.5]:
+                    for ch in [0.6, 0.7, 0.8]:
                         for clm in [0.3, 0.5, 0.7]:
                             sweep_count += 1
                             trades, eq, dd = backtest_v119(
